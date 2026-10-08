@@ -2,11 +2,16 @@
 	import { untrack, onMount, onDestroy, tick } from 'svelte';
 	import { beforeNavigate } from '$app/navigation';
 	import { createContractWorkspace, setContractWorkspace } from '$lib/document/runtime/context';
-	import { recordAdminSourceUpdate, recordContractInput } from '$lib/document/runtime/render-perf';
+	import {
+		recordAdminQueryOwner,
+		recordAdminSourceUpdate,
+		recordContractInput
+	} from '$lib/document/runtime/render-perf';
 	import { sameSourceRange, snapshotPreviewChanges } from '$lib/document/runtime/types';
 	import { env } from '$env/dynamic/public';
-	import { useConvexClient } from 'convex-svelte';
-	import { getAdminQueries } from '$lib/contract/admin-queries.svelte';
+	import { useConvexClient, useQuery } from 'convex-svelte';
+	import { api } from '../../../convex/_generated/api';
+	import type { ContractSourceInput } from '$lib/document/runtime/source.svelte';
 	import { AuthoringSession } from '$lib/playbook/authoring.svelte';
 	import { convexSaveTransport } from '$lib/playbook/save-transport';
 	import type { OperationStatus } from '$lib/components/chrome/operation-status';
@@ -18,9 +23,17 @@
 	import PlaybookEditor from '$lib/components/playbook/PlaybookEditor.svelte';
 	import WorkspaceChrome from './WorkspaceChrome.svelte';
 	import { setInteractionOwner } from '$lib/components/ui/interactions';
+	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
 
 	const client = env.PUBLIC_CONVEX_URL ? useConvexClient() : null;
-	const data = getAdminQueries();
+	const session = useViewerSession();
+	const data: ContractSourceInput = client
+		? {
+				blocks: useQuery(api.contract.getBlocks, {}),
+				items: useQuery(api.playbookItems.list, {})
+			}
+		: { blocks: { error: true }, items: { error: true } };
+	onMount(() => (client ? recordAdminQueryOwner() : undefined));
 	const resources = getDocumentResources();
 	const resource = resources ? untrack(() => resources.acquire('admin', data)) : undefined;
 	if (resource && resources) untrack(() => resources.activate(resource));
@@ -51,10 +64,8 @@
 		return () => clearTimeout(timer);
 	});
 	$effect(() => {
-		if (!resources) {
-			workspace.accept(data);
-			recordAdminSourceUpdate();
-		}
+		workspace.accept(data);
+		recordAdminSourceUpdate();
 	});
 	const flow: AuthoringFlow = new AuthoringFlow(authoring, () => ({
 		index: source.compiled?.index ?? null,
@@ -75,6 +86,26 @@
 			) ?? []
 		)
 	);
+	onMount(() =>
+		session.registerEditor({
+			get pending() {
+				return flow.hasUnsavedWork;
+			},
+			flush: async () => (await authoring.flush()) && !flow.addingConcession,
+			retry: () => {
+				void authoring.retry();
+			},
+			suspend: () => {},
+			resume: () => {},
+			freeze: () => {},
+			discard: () => {
+				flow.cancelAddition();
+				authoring.discard();
+			},
+			restartTransport: () => authoring.restartTransport()
+		})
+	);
+	onDestroy(() => authoring.restartTransport());
 	// Each selection stays blue until its own replacement participates in the preview.
 	const authoringHighlightRanges = $derived(
 		flow.selectedRanges.filter(
@@ -104,6 +135,11 @@
 		flow.clearFeedback();
 	}
 	beforeNavigate((navigation) => {
+		if (session.closing) return;
+		if (session.blocked && !navigation.willUnload) {
+			navigation.cancel();
+			return;
+		}
 		// Document unload uses the browser warning below, without discarding first.
 		if (navigation.willUnload) return;
 		if (authoring.unresolved) {
@@ -122,6 +158,7 @@
 	});
 	onMount(() => {
 		const warn = (event: BeforeUnloadEvent) => {
+			if (session.closing) return;
 			if (!flow.hasUnsavedWork) return;
 			event.preventDefault();
 			event.returnValue = '';

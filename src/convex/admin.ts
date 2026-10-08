@@ -1,40 +1,29 @@
-import { validatePlaybook } from '../lib/playbook/audit';
+import { requireProfile, scopedOperation } from './auth';
+import { assertAuthoringAvailable, publishTemplate } from './templates';
 import { v } from 'convex/values';
-import { mutation, type MutationCtx } from './_generated/server';
+import { mutation } from './_generated/server';
 import type { Doc } from './_generated/dataModel';
 import schema from './schema';
 import { playbookItem } from './playbookValidators';
 import type { PlaybookItem } from '../lib/playbook/model';
-import { equalPlaybookStructure } from '../lib/playbook/draft';
 import {
 	validatePlaybookItemContent,
 	validateNewConcessions,
-	validateConcessionUpdate,
-	MAX_CONTRACT_BLOCKS,
-	MAX_PLAYBOOK_ITEMS
+	validateConcessionUpdate
 } from '../lib/playbook/validation';
+import { PlaybookValidationError } from '../lib/playbook/validation-error';
 
-async function validate(ctx: MutationCtx, item: PlaybookItem, saved?: Doc<'playbookItems'>) {
+async function validate(item: PlaybookItem, saved?: Doc<'playbookItems'>) {
 	try {
-		if (saved && equalPlaybookStructure(saved, item)) {
-			validatePlaybookItemContent(item);
-			return null;
-		}
-		const blocks = await ctx.db
-			.query('contractBlocks')
-			.withIndex('by_order')
-			.take(MAX_CONTRACT_BLOCKS + 1);
-		const existing = await ctx.db.query('playbookItems').take(MAX_PLAYBOOK_ITEMS + 1);
-		if (existing.length > MAX_PLAYBOOK_ITEMS)
-			return { status: 'rejected' as const, message: 'Playbook exceeds supported size' };
+		validatePlaybookItemContent(item);
 		if (saved) validateConcessionUpdate(saved, item);
 		else validateNewConcessions(item.concessions);
-		validatePlaybook(blocks, [...existing.filter((record) => record._id !== saved?._id), item]);
 		return null;
 	} catch (error) {
+		if (!(error instanceof PlaybookValidationError)) throw error;
 		return {
 			status: 'rejected' as const,
-			message: error instanceof Error ? error.message : 'Invalid Playbook Item'
+			message: error.message
 		};
 	}
 }
@@ -57,6 +46,7 @@ export const savePlaybookItem = mutation({
 		missing
 	),
 	handler: async (ctx, { id, item, expectedRevision, operationId }) => {
+		const profile = await requireProfile(ctx);
 		if (
 			!Number.isSafeInteger(expectedRevision) ||
 			expectedRevision < 0 ||
@@ -66,40 +56,54 @@ export const savePlaybookItem = mutation({
 		if (!id) {
 			const receipt = await ctx.db
 				.query('creationReceipts')
-				.withIndex('by_operationId', (q) => q.eq('operationId', operationId))
+				.withIndex('by_operationId', (q) =>
+					q.eq('operationId', scopedOperation(profile, operationId))
+				)
 				.unique();
 			if (receipt) {
 				const current = await ctx.db.get('playbookItems', receipt.itemId);
 				if (!current) return { status: 'missing' as const };
 				return {
 					status:
-						current.lastOperationId === operationId ? ('saved' as const) : ('conflict' as const),
+						current.lastOperationId === operationId && current.lastOperationCaller === profile._id
+							? ('saved' as const)
+							: ('conflict' as const),
 					item: current
 				};
 			}
+			await assertAuthoringAvailable(ctx);
 			const created = {
 				...item,
 				revision: 1,
+				lastOperationCaller: profile._id,
 				lastOperationId: operationId
 			};
-			const rejection = await validate(ctx, item);
+			const rejection = await validate(item);
 			if (rejection) return rejection;
 			const newId = await ctx.db.insert('playbookItems', created);
-			await ctx.db.insert('creationReceipts', { operationId, itemId: newId });
+			await ctx.db.insert('creationReceipts', {
+				operationId: scopedOperation(profile, operationId),
+				itemId: newId
+			});
+			await publishTemplate(ctx);
 			return { status: 'saved' as const, item: (await ctx.db.get('playbookItems', newId))! };
 		}
 		const current = await ctx.db.get('playbookItems', id);
 		if (!current) return { status: 'missing' as const };
-		if (current.lastOperationId === operationId) return { status: 'saved' as const, item: current };
+		if (current.lastOperationId === operationId && current.lastOperationCaller === profile._id)
+			return { status: 'saved' as const, item: current };
 		if ((current.revision ?? 0) !== expectedRevision)
 			return { status: 'conflict' as const, item: current };
-		const rejection = await validate(ctx, item, current);
+		await assertAuthoringAvailable(ctx);
+		const rejection = await validate(item, current);
 		if (rejection) return rejection;
 		await ctx.db.replace('playbookItems', id, {
 			...item,
 			revision: expectedRevision + 1,
+			lastOperationCaller: profile._id,
 			lastOperationId: operationId
 		});
+		await publishTemplate(ctx);
 		return { status: 'saved' as const, item: (await ctx.db.get('playbookItems', id))! };
 	}
 });
@@ -108,10 +112,15 @@ export const deletePlaybookItem = mutation({
 	args: { id: v.id('playbookItems'), expectedRevision: v.number() },
 	returns: v.union(v.object({ status: v.literal('deleted') }), conflict),
 	handler: async (ctx, { id, expectedRevision }) => {
+		await requireProfile(ctx);
 		const current = await ctx.db.get('playbookItems', id);
 		if (current && (current.revision ?? 0) !== expectedRevision)
 			return { status: 'conflict' as const, item: current };
-		if (current) await ctx.db.delete('playbookItems', id);
+		if (current) {
+			await assertAuthoringAvailable(ctx);
+			await ctx.db.delete('playbookItems', id);
+			await publishTemplate(ctx);
+		}
 		return { status: 'deleted' as const };
 	}
 });

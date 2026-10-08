@@ -1,7 +1,7 @@
 import { paginationOptsValidator, paginationResultValidator } from 'convex/server';
 import { ConvexError, v } from 'convex/values';
-import { mutation, query, type QueryCtx } from './_generated/server';
-import type { Doc } from './_generated/dataModel';
+import { mutation, query } from './_generated/server';
+import type { Doc, Id } from './_generated/dataModel';
 import schema from './schema';
 import {
 	contractCard,
@@ -10,38 +10,25 @@ import {
 	selections,
 	snapshot
 } from './savedContractValidators';
-import { MAX_CONTRACT_BLOCKS, MAX_PLAYBOOK_ITEMS } from '../lib/playbook/validation';
-import { validatePlaybook } from '../lib/playbook/audit';
+import { MAX_SELECTED_CONCESSIONS } from '../lib/contract/selection-limits';
+import {
+	currentPointer,
+	readLiveSnapshot,
+	readSnapshot,
+	readSnapshotBlocks,
+	readSnapshotItem
+} from './templates';
 import { CompiledContract } from '../lib/contract/compiled-contract';
 import { toDocumentOverlay } from '../lib/playbook/document-overlay';
 import { activeConflicts } from '../lib/playbook/selection-conflicts';
 import { sameSelection } from '../lib/playbook/model';
-import { OCEANS_PROFILE } from '../lib/profiles';
+import { requireProfile, accessibleContract, creatorDeleted, scopedOperation } from './auth';
 
 function companyName(value: string) {
 	const name = value.trim();
 	if (!name) throw new ConvexError('Enter a buyer company name.');
 	if (name.length > 200) throw new ConvexError('Company names must be 200 characters or fewer.');
 	return name;
-}
-
-async function readSnapshot(ctx: QueryCtx, contract: Doc<'savedContracts'>) {
-	const [blocks, items] = await Promise.all([
-		ctx.db
-			.query('contractSnapshotBlocks')
-			.withIndex('by_contractId', (q) => q.eq('contractId', contract._id))
-			.take(MAX_CONTRACT_BLOCKS + 1),
-		ctx.db
-			.query('contractSnapshotItems')
-			.withIndex('by_contractId', (q) => q.eq('contractId', contract._id))
-			.take(MAX_PLAYBOOK_ITEMS + 1)
-	]);
-	if (blocks.length !== contract.blockCount || items.length !== contract.itemCount)
-		throw new ConvexError('This contract snapshot is incomplete.');
-	return {
-		blocks: blocks.map((row) => row.block).sort((a, b) => a.order - b.order),
-		items: items.map((row) => row.item)
-	};
 }
 
 function stateOf(contract: Doc<'savedContracts'>) {
@@ -53,21 +40,6 @@ function stateOf(contract: Doc<'savedContracts'>) {
 	};
 }
 
-async function readCurrentSnapshot(ctx: QueryCtx) {
-	const [records, items] = await Promise.all([
-		ctx.db
-			.query('contractBlocks')
-			.withIndex('by_order')
-			.take(MAX_CONTRACT_BLOCKS + 1),
-		ctx.db.query('playbookItems').take(MAX_PLAYBOOK_ITEMS + 1)
-	]);
-	if (!records.length) throw new ConvexError('The baseline contract is not available.');
-	if (records.length > MAX_CONTRACT_BLOCKS || items.length > MAX_PLAYBOOK_ITEMS)
-		throw new ConvexError('Contract exceeds supported size.');
-	const blocks = records.map(({ _id, _creationTime, ...block }) => block);
-	return { blocks, items };
-}
-
 function validateOperationId(operationId: string) {
 	if (!operationId.trim() || operationId.length > 200)
 		throw new ConvexError('Invalid save operation.');
@@ -77,23 +49,51 @@ export const browse = query({
 	args: { search: v.string(), paginationOpts: paginationOptsValidator },
 	returns: paginationResultValidator(contractCard),
 	handler: async (ctx, args) => {
+		await requireProfile(ctx);
 		const search = args.search.trim().slice(0, 200);
 		const contracts = ctx.db.query('savedContracts');
 		const query = search
 			? contracts.withSearchIndex('search_companyName', (q) => q.search('companyName', search))
 			: contracts.withIndex('by_savedAt').order('desc');
-		const result = await query.paginate({
-			...args.paginationOpts,
-			numItems: Math.min(args.paginationOpts.numItems, 48)
-		});
+		const result = await query.paginate(args.paginationOpts);
+		const creators = new Map<
+			Id<'profiles'> | undefined,
+			Promise<{
+				name: string;
+				avatarUrl: string | null;
+			} | null>
+		>();
+		function resolveCreator(id: Id<'profiles'> | undefined) {
+			let creator = creators.get(id);
+			if (!creator) {
+				creator = (async () => {
+					if (await creatorDeleted(ctx, id)) return null;
+					const profile = id ? await ctx.db.get('profiles', id) : null;
+					return {
+						name: profile?.name || profile?.email || 'Colleague',
+						avatarUrl: profile?.avatarId ? await ctx.storage.getUrl(profile.avatarId) : null
+					};
+				})();
+				creators.set(id, creator);
+			}
+			return creator;
+		}
 		return {
 			...result,
-			page: result.page.map(({ _id, companyName, savedAt }) => ({
-				_id,
-				companyName,
-				savedAt,
-				creator: OCEANS_PROFILE
-			}))
+			page: (
+				await Promise.all(
+					result.page.map(async (contract) => {
+						const creator = await resolveCreator(contract.creatorId);
+						if (!creator) return null;
+						return {
+							_id: contract._id,
+							companyName: contract.companyName,
+							savedAt: contract.savedAt,
+							creator
+						};
+					})
+				)
+			).filter((card): card is NonNullable<typeof card> => card !== null)
 		};
 	}
 });
@@ -101,7 +101,10 @@ export const browse = query({
 export const currentSnapshot = query({
 	args: {},
 	returns: snapshot,
-	handler: readCurrentSnapshot
+	handler: async (ctx) => {
+		await requireProfile(ctx);
+		return readLiveSnapshot(ctx);
+	}
 });
 
 export const load = query({
@@ -115,8 +118,11 @@ export const load = query({
 		})
 	),
 	handler: async (ctx, { id }) => {
+		await requireProfile(ctx);
 		const contractId = ctx.db.normalizeId('savedContracts', id);
-		const contract = contractId ? await ctx.db.get('savedContracts', contractId) : null;
+		const contract = contractId
+			? await accessibleContract(ctx, await ctx.db.get('savedContracts', contractId))
+			: null;
 		if (!contract) return null;
 		const { baselineVersion, playbookVersion, ...details } = contract;
 		return { contract: details, snapshot: await readSnapshot(ctx, contract) };
@@ -128,8 +134,11 @@ export const state = query({
 	args: { id: v.string() },
 	returns: v.union(contractState, v.null()),
 	handler: async (ctx, { id }) => {
+		await requireProfile(ctx);
 		const contractId = ctx.db.normalizeId('savedContracts', id);
-		const contract = contractId ? await ctx.db.get('savedContracts', contractId) : null;
+		const contract = contractId
+			? await accessibleContract(ctx, await ctx.db.get('savedContracts', contractId))
+			: null;
 		return contract ? stateOf(contract) : null;
 	}
 });
@@ -137,44 +146,55 @@ export const state = query({
 export const create = mutation({
 	args: { companyName: v.string(), operationId: v.string() },
 	returns: v.union(
-		v.object({ status: v.literal('created'), id: v.id('savedContracts') }),
+		v.object({
+			status: v.literal('created'),
+			id: v.id('savedContracts'),
+			contract: schema.doc('savedContracts').omit('baselineVersion', 'playbookVersion')
+		}),
 		v.object({ status: v.literal('deleted') })
 	),
 	handler: async (ctx, args) => {
+		const profile = await requireProfile(ctx);
 		validateOperationId(args.operationId);
 		const receipt = await ctx.db
 			.query('contractCreationReceipts')
-			.withIndex('by_operationId', (q) => q.eq('operationId', args.operationId))
+			.withIndex('by_operationId', (q) =>
+				q.eq('operationId', scopedOperation(profile, args.operationId))
+			)
 			.unique();
 		if (receipt) {
-			return (await ctx.db.get('savedContracts', receipt.contractId))
-				? { status: 'created' as const, id: receipt.contractId }
-				: { status: 'deleted' as const };
+			const original = await ctx.db.get('savedContracts', receipt.contractId);
+			if (!(await accessibleContract(ctx, original))) return { status: 'deleted' as const };
+			const { baselineVersion, playbookVersion, ...contract } = original!;
+			return { status: 'created' as const, id: receipt.contractId, contract };
 		}
 		const name = companyName(args.companyName);
-		// Capture the current source in the same transaction that creates the contract.
-		const captured = await readCurrentSnapshot(ctx);
-		const { blocks, items } = captured;
-		if (new TextEncoder().encode(JSON.stringify(captured)).byteLength > 8_000_000)
-			throw new ConvexError('Contract snapshot exceeds supported size.');
-		validatePlaybook(blocks, items);
+		const pointer = await currentPointer(ctx);
+		if (pointer?.maintenance)
+			throw new ConvexError('Template maintenance is in progress. Try again shortly.');
+		const version = pointer?.versionId
+			? await ctx.db.get('templateVersions', pointer.versionId)
+			: null;
+		if (!version) throw new ConvexError('The baseline contract is not available.');
 		const id = await ctx.db.insert('savedContracts', {
 			companyName: name,
+			creatorId: profile._id,
 			savedAt: Date.now(),
 			selectedConcessions: {},
 			revision: 0,
-			blockCount: blocks.length,
-			itemCount: items.length
+			templateVersionId: version._id,
+			blockCount: version.blockCount,
+			itemCount: version.itemCount
 		});
-		for (const block of blocks)
-			await ctx.db.insert('contractSnapshotBlocks', { contractId: id, block });
-		for (const item of items)
-			await ctx.db.insert('contractSnapshotItems', { contractId: id, itemId: item._id, item });
 		await ctx.db.insert('contractCreationReceipts', {
-			operationId: args.operationId,
+			operationId: scopedOperation(profile, args.operationId),
 			contractId: id
 		});
-		return { status: 'created' as const, id };
+		const { baselineVersion, playbookVersion, ...contract } = (await ctx.db.get(
+			'savedContracts',
+			id
+		))!;
+		return { status: 'created' as const, id, contract };
 	}
 });
 
@@ -187,13 +207,14 @@ export const saveChoices = mutation({
 	},
 	returns: saveResult,
 	handler: async (ctx, { id, selectedConcessions, expectedRevision, operationId }) => {
+		const profile = await requireProfile(ctx);
 		validateOperationId(operationId);
 		if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
 			throw new ConvexError('Invalid contract revision.');
-		const contract = await ctx.db.get('savedContracts', id);
+		const contract = await accessibleContract(ctx, await ctx.db.get('savedContracts', id));
 		if (!contract) return { status: 'deleted' as const };
 		// A replay is acknowledged before checking its now-stale expected revision.
-		if (contract.lastOperationId === operationId)
+		if (contract.lastOperationId === operationId && contract.lastOperationCaller === profile._id)
 			return { status: 'saved' as const, state: stateOf(contract) };
 		if ((contract.revision ?? 0) !== expectedRevision)
 			return { status: 'conflict' as const, state: stateOf(contract) };
@@ -201,41 +222,29 @@ export const saveChoices = mutation({
 		// operation ID. A retry after an intervening change still follows conflict rules.
 		if (sameSelection(contract.selectedConcessions, selectedConcessions))
 			return { status: 'saved' as const, state: stateOf(contract) };
-		// Snapshots are validated once at creation and never edited. Validate membership
+		// Snapshots are validated once at publication and never edited. Validate membership
 		// first; baseline compilation is only needed to check conflicts between items.
 		const selectedIds = Object.keys(selectedConcessions) as Doc<'playbookItems'>['_id'][];
-		if (selectedIds.length > MAX_PLAYBOOK_ITEMS)
+		if (selectedIds.length > MAX_SELECTED_CONCESSIONS)
 			throw new ConvexError('Too many selected concessions.');
 		const items: Doc<'playbookItems'>[] = [];
 		// Bound concurrent I/O while reading only the selected snapshot items.
 		const batchSize = 64;
 		for (let offset = 0; offset < selectedIds.length; offset += batchSize) {
+			const selected = selectedIds.slice(offset, offset + batchSize);
 			const rows = await Promise.all(
-				selectedIds.slice(offset, offset + batchSize).map((itemId) =>
-					ctx.db
-						.query('contractSnapshotItems')
-						.withIndex('by_contractId_and_itemId', (q) =>
-							q.eq('contractId', id).eq('itemId', itemId)
-						)
-						.unique()
-				)
+				selected.map((itemId) => readSnapshotItem(ctx, contract, itemId))
 			);
-			for (const row of rows) {
-				if (!row?.item.concessions.some((c) => c.id === selectedConcessions[row.itemId]))
+			for (let index = 0; index < rows.length; index++) {
+				const item = rows[index];
+				if (!item?.concessions.some((c) => c.id === selectedConcessions[selected[index]]))
 					throw new ConvexError('A selected concession does not belong to this contract.');
-				items.push(row.item);
+				items.push(item);
 			}
 		}
 		if (items.length > 1) {
-			const blocks = await ctx.db
-				.query('contractSnapshotBlocks')
-				.withIndex('by_contractId', (q) => q.eq('contractId', id))
-				.take(MAX_CONTRACT_BLOCKS + 1);
-			if (blocks.length !== contract.blockCount)
-				throw new ConvexError('This contract snapshot is incomplete.');
-			const compiled = new CompiledContract(
-				blocks.map((row) => row.block).sort((a, b) => a.order - b.order)
-			);
+			const blocks = await readSnapshotBlocks(ctx, contract);
+			const compiled = new CompiledContract(blocks);
 			if (activeConflicts(compiled.index, items.map(toDocumentOverlay), selectedConcessions).length)
 				throw new ConvexError('Remove conflicting concessions before saving.');
 		}
@@ -244,6 +253,7 @@ export const saveChoices = mutation({
 			selectedConcessions,
 			revision,
 			lastOperationId: operationId,
+			lastOperationCaller: profile._id,
 			savedAt: Date.now()
 		});
 		return {
@@ -257,7 +267,8 @@ export const rename = mutation({
 	args: { id: v.id('savedContracts'), companyName: v.string() },
 	returns: v.null(),
 	handler: async (ctx, { id, companyName: value }) => {
-		const contract = await ctx.db.get('savedContracts', id);
+		await requireProfile(ctx);
+		const contract = await accessibleContract(ctx, await ctx.db.get('savedContracts', id));
 		if (!contract) throw new ConvexError('This contract was deleted.');
 		const name = companyName(value);
 		if (name === contract.companyName) return null;
@@ -270,7 +281,8 @@ export const remove = mutation({
 	args: { id: v.id('savedContracts') },
 	returns: v.null(),
 	handler: async (ctx, { id }) => {
-		if (!(await ctx.db.get('savedContracts', id))) return null;
+		await requireProfile(ctx);
+		if (!(await accessibleContract(ctx, await ctx.db.get('savedContracts', id)))) return null;
 		for (const table of ['contractSnapshotBlocks', 'contractSnapshotItems'] as const) {
 			const rows = await ctx.db
 				.query(table)
@@ -278,6 +290,16 @@ export const remove = mutation({
 				.take(4097);
 			if (rows.length > 4096) throw new ConvexError('Contract exceeds supported size.');
 			for (const row of rows) await ctx.db.delete(table, row._id);
+		}
+		const request = await ctx.db
+			.query('approvalRequests')
+			.withIndex('by_contractId', (q) => q.eq('contractId', id))
+			.unique();
+		if (request) {
+			const job = await ctx.db.system.get('_scheduled_functions', request.sendJobId);
+			if (job?.state.kind === 'pending' || job?.state.kind === 'inProgress')
+				await ctx.scheduler.cancel(request.sendJobId);
+			await ctx.db.delete('approvalRequests', request._id);
 		}
 		await ctx.db.delete('savedContracts', id);
 		return null;

@@ -503,7 +503,7 @@
 		return () => observer.disconnect();
 	});
 	function retryRender() {
-		if (!interacting) return;
+		if (!prepare) return;
 		if (requestedModel.error) {
 			renderer.fail(requestedModel.error);
 			return;
@@ -564,12 +564,16 @@
 		if (interacting) recordColdStart('viewer-mounted');
 	});
 	$effect(() => {
-		if (!interacting) return;
 		viewer.retry = retryRender;
+		return () => {
+			viewer.retry = undefined;
+		};
+	});
+	$effect(() => {
+		if (!interacting) return;
 		viewer.restoreAnnotationFocus = restoreAnnotationFocus;
 		viewer.captureAnnotationFocus = captureAnnotationFocus;
 		return () => {
-			viewer.retry = undefined;
 			viewer.restoreAnnotationFocus = undefined;
 			viewer.captureAnnotationFocus = undefined;
 		};
@@ -598,6 +602,8 @@
 			enabled = prepare,
 			layoutProfiler = profiler,
 			warm = activationComplete;
+		// Paused retained viewers keep their pages without scheduling more work.
+		if (!enabled && retained) return;
 		if (!enabled || !layoutProfiler || !generation) {
 			if (!warm)
 				untrack(() => {

@@ -52,7 +52,10 @@ npx convex dev
 ```
 
 For a fresh development deployment, run `npm run convex:seed` and `npm run dev`.
-Configure `PUBLIC_CONVEX_URL` in `.env.local` for the backend.
+Configure `PUBLIC_CONVEX_URL` and the Clerk development keys in `.env.local`.
+Follow [Clerk setup and rollout](docs/clerk-auth.md) before starting `convex dev`:
+the backend needs the matching JWT issuer. Local verification and production builds
+can run before Clerk is configured; the app shows a setup screen until keys exist.
 The canonical bootstrap data is `data/convex`: 113 immutable blocks and
 56 Playbook Items, containing 62 Triggers, 26 concessions and 66 changes.
 The seed command refuses to overwrite edited runtime records and resumes an
@@ -62,10 +65,81 @@ Use a fresh deployment for this schema, or explicitly migrate existing data
 before pushing it. Existing records and scheduled lifecycle jobs must be handled
 by that migration.
 
+## Approval request email (preliminary)
+
+An applied concession requires approval when its instruction box's “Changes need
+to be approved” field contains nonblank text in the saved contract's playbook
+snapshot. These concessions block Word download. Removing all of them restores
+normal download eligibility. “Ask for approval” is available once the contract is
+saved, connected, and free of errors or conflicts.
+
+Requests capture the saved company name and every applied concession's description,
+mark the concessions requiring approval, and omit approval-guidance text. The email
+subject is `Approval requested — <company name>` and its single workspace link is
+`APP_URL/contracts/<contract ID>`. One latest request per contract lives in the
+`approvalRequests` table, separate from saving state and revisions. Requests capture
+the company name and compact snapshot item IDs plus concession positions; the Node
+action loads descriptions in batches of four and builds the full email there.
+Contracts without previous requests need no backfill.
+
+Configure these **Convex backend environment variables** on the intended deployment
+with `npx convex env set NAME value` (not as public SvelteKit environment variables):
+
+| Variable            | Value                                                        |
+| ------------------- | ------------------------------------------------------------ |
+| `APPROVAL_EMAIL`    | `ben@oceanstalent.com`                                       |
+| `SMTP_USER`         | `julien.newman@gmail.com`                                    |
+| `SMTP_APP_PASSWORD` | Gmail app password for that account; setup deferred          |
+| `APP_URL`           | Live app origin, without a query or fragment; value deferred |
+
+Nodemailer uses `smtp.gmail.com:465` with TLS. Missing variables are listed in the
+request's failure feedback. A durable marker records dispatch immediately before
+SMTP. Recovery checks the scheduled action every minute and blocks all further
+requests while that job is pending or running. A stopped job with no dispatch is a
+confirmed failure. DNS failure (`EDNS`), message preparation failures (`EMESSAGE`
+at `API` or `MAIL FROM`), explicit SMTP rejection, and authentication failures are
+also confirmed failures; explicit retry is available as soon as the original job
+ends.
+
+An ambiguous failure after dispatch, including Gmail acceptance whose status could
+not be persisted, a malformed final `DATA` reply without explicit rejection, or a
+generic connection failure, is uncertain. All requests for that contract are
+blocked for 10 minutes after uncertainty is detected. A scheduled mutation enables explicit
+retry after the cooldown and original job completion. The recovery chain created
+with the request owns every subsequent poll and cooldown job; result persistence
+does not schedule jobs or restart the uncertainty detection time. Feedback explains
+that a retry may deliver a duplicate email; the delay does not guarantee uniqueness.
+Only status persistence is retried automatically, never SMTP. Success blocks
+duplicates for identical selections; changed selections allow a new request after
+the original job ends. Deletion atomically removes the request, snapshot, and
+contract, canceling the send job only while pending or running. Missing or terminal
+jobs do not block deletion; an email already dispatched cannot be recalled.
+Completion and recovery match request IDs so old jobs cannot overwrite newer requests.
+
+Delivery logs include request ID, operation stage, allowlisted error codes and SMTP
+commands, numeric response code, and message ID on acceptance. Credentials, email
+bodies, raw SMTP responses, and raw transport messages are excluded.
+
+Before rolling this schema out to a deployment with embedded
+`latestApprovalRequest` records, stop new requests and drain all old approval send
+jobs. Use an intermediate schema retaining that optional field while adding
+`approvalRequests`; convert each selected concession ID to its position in the
+contract's immutable snapshot, capture its company name, and preserve sent/failed
+results. Convert unresolved legacy sending records to uncertain with a fresh
+10-minute cooldown. Remove embedded fields only after checking conversion counts,
+then deploy this final schema. The inspected personal dev deployment had no
+embedded records or scheduled jobs, so it required no conversion.
+
+Sending an email keeps download blocked. This version has no approval decisions,
+approver controls, attachments, or automatic unlocking. The
+download restriction applies to the existing app interface. Gmail delivery remains
+unverified until the credentials and live app URL are configured.
+
 ## Verification
 
 ```sh
 npm run seed:verify
+npm run verify
 npm run check
 npm run format:check
 npm run build
@@ -78,6 +152,17 @@ verifier uses deterministic row identities only within verification; no second
 business identity is stored. It compares all 58 frozen compositor states,
 including full source/provenance signatures, pagination token conservation and
 server-rendered provenance attributes; see the [reference policy](docs/overlay-rendering.md#verification).
+
+Contract creation, immutable publication, development measurements, and the staged
+rollout are documented in [the creation report](docs/contract-creation-performance.md).
+
+Agreed uses open email-code signup, one shared company, and `rep` / `admin`
+profiles. Everyone can edit their own name and avatar in Settings; only admins
+can edit the shared company name and avatar. Roles are assigned through a trusted
+backend operation. Contracts retain their original creator; deleting a Clerk
+account immediately blocks its access and hides that creator's contracts when the
+signed webhook commits, then removes their data in resumable batches. See
+[authentication configuration and rehearsal](docs/clerk-auth.md).
 
 See [workspace ownership](docs/persistent-workspace.md),
 [rendering](docs/overlay-rendering.md), [performance](docs/rendering-snappiness.md),

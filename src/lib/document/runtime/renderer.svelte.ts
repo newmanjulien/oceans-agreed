@@ -157,6 +157,7 @@ export class ContractRenderController {
 			queued &&
 			queued.source === input.source &&
 			queued.profiler === input.profiler &&
+			Boolean(queued.progressive) === Boolean(input.progressive) &&
 			sameSelection(queued.concessions, input.concessions) &&
 			samePreviewChanges(queued.previewChanges, input.previewChanges ?? EMPTY_PREVIEW_CHANGES)
 		)

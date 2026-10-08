@@ -1,8 +1,9 @@
 import { v } from 'convex/values';
 import { baselineBlock } from './sourceValidators';
 import schema from './schema';
+import { selections } from './contractValidators';
 
-export const selections = v.record(v.id('playbookItems'), v.string());
+export { selections };
 export const snapshot = v.object({
 	blocks: v.array(baselineBlock),
 	items: v.array(schema.doc('playbookItems'))

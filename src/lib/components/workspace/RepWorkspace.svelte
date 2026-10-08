@@ -4,11 +4,13 @@
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { navigating } from '$app/state';
 	import type { BeforeNavigate } from '@sveltejs/kit';
-	import { useConvexClient } from 'convex-svelte';
+	import { useAuth, useConvexClient, useQuery } from 'convex-svelte';
 	import { api } from '../../../convex/_generated/api';
 	import type { Doc, Id } from '../../../convex/_generated/dataModel';
 	import type { ContractSnapshot, ContractState } from '$lib/contract/saved';
 	import { ContractPersistence } from '$lib/contract/persistence.svelte';
+	import { DraftJournal } from '$lib/contract/draft-recovery.svelte';
+	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
 	import { recordOpening } from '$lib/contract/browser-storage';
 	import { getContractSnapshotCache } from '$lib/contract/snapshot-cache';
 	import type { OperationStatus } from '$lib/components/chrome/operation-status';
@@ -26,6 +28,8 @@
 	import type { ConcessionSelection, ContractRenderSource } from '$lib/document/runtime/types';
 	import { composeExport } from '$lib/contract/export/content';
 	import { downloadWord, prepareWord, retireWordUrl } from '$lib/contract/export/word';
+	import { requiresApproval, matchesApprovalSelection } from '$lib/contract/approval';
+	import { saveError } from '$lib/contract/saved';
 	let {
 		snapshot,
 		initialContract,
@@ -67,7 +71,17 @@
 
 	const { source, viewer } = workspace;
 	const client = useConvexClient();
+	const auth = useAuth();
+	const session = useViewerSession();
 	const contractId = untrack(() => initialContract._id);
+	const journal = untrack(() => new DraftJournal(session.userId!, contractId));
+	let mounted = $state(false);
+	const approvalQuery = useQuery(api.approvals.latest, () =>
+		mounted && auth.isAuthenticated ? { id: contractId } : 'skip'
+	);
+	let requestingApproval = $state(false);
+	let approvalError = $state<string | null>(null);
+	const latestApproval = $derived(approvalQuery.data);
 	const persistence = untrack(
 		() =>
 			new ContractPersistence(
@@ -78,11 +92,45 @@
 					revision: initialContract.revision ?? 0,
 					lastOperationId: initialContract.lastOperationId ?? null
 				},
-				(request) => client.mutation(api.savedContracts.saveChoices, request)
+				(request) => client.mutation(api.savedContracts.saveChoices, request),
+				(draft) => journal.write(draft),
+				journal.read()
 			)
 	);
+	function resumeSaving() {
+		if (
+			auth.isAuthenticated &&
+			metadata.data &&
+			!metadata.error &&
+			['ready', 'saving-before-logout'].includes(session.phase)
+		)
+			persistence.resume();
+	}
+	onMount(() =>
+		session.registerEditor({
+			get pending() {
+				return persistence.pending;
+			},
+			flush: () => persistence.flush(),
+			retry: () => persistence.retry(),
+			suspend: () => persistence.pause(),
+			resume: resumeSaving,
+			freeze: (frozen) => persistence.freeze(frozen),
+			discard: () => persistence.discard(),
+			restartTransport: () => persistence.restartTransport()
+		})
+	);
+	$effect(() => {
+		const ready = Boolean(auth.isAuthenticated && metadata.data && !metadata.error);
+		const phase = session.phase;
+		untrack(() => {
+			if (ready && ['ready', 'saving-before-logout'].includes(phase)) resumeSaving();
+			else persistence.pause();
+		});
+	});
 	$effect(() => {
 		const next = metadata.data;
+		if (!auth.isAuthenticated) return;
 		if (next === null) {
 			getContractSnapshotCache().remove(contractId);
 		}
@@ -101,18 +149,42 @@
 		const choices = persistence.choices;
 		if (resource && resources) resources.update(resource, choices);
 	});
-	let notifiedVisible = false;
+	let notifiedVisible = $state(false);
 	let recordedOpening = false;
+	const displayedStateReconciled = $derived.by(() => {
+		const displayed = viewer.displayedSnapshot;
+		return Boolean(
+			stateReconciled &&
+			!persistence.recoveryPending &&
+			viewer.visible &&
+			viewer.prepared &&
+			displayed &&
+			displayed === workspace.renderer.snapshot &&
+			displayed.source === source.renderSource &&
+			!displayed.previewChanges.length &&
+			sameSelection(displayed.concessions, persistence.choices) &&
+			(persistence.conflict ||
+				sameSelection(displayed.concessions, persistence.confirmed.selectedConcessions))
+		);
+	});
 	$effect(() => {
-		if (viewer.visible && !persistence.deleted && !source.issue && !notifiedVisible) {
+		if (
+			displayedStateReconciled &&
+			!persistence.deleted &&
+			!source.issue &&
+			!workspace.renderer.error &&
+			!viewer.preparationBlocked &&
+			!notifiedVisible
+		) {
 			notifiedVisible = true;
 			untrack(() => onVisible?.());
 		}
 	});
 	$effect(() => {
 		if (
-			viewer.visible &&
+			displayedStateReconciled &&
 			viewer.ready &&
+			!persistence.pending &&
 			!persistence.deleted &&
 			!workspace.renderer.error &&
 			!source.issue &&
@@ -127,14 +199,22 @@
 	$effect(() => {
 		if (
 			!notifiedVisible &&
-			(workspace.renderer.error || source.issue || viewer.preparationBlocked || persistence.deleted)
+			(workspace.renderer.error ||
+				source.issue ||
+				viewer.preparationBlocked ||
+				persistence.deleted ||
+				metadata.error)
 		)
 			untrack(() => onFailure?.());
 	});
-	let connected = $state(true);
+	let connected = $state(false);
 	let active = true;
 	const historyEvents = new AbortController();
 	onMount(() => {
+		mounted = true;
+	});
+	$effect(() => {
+		if (!mounted) return;
 		connected = client.connectionState().isWebSocketConnected;
 		return client.subscribeToConnectionState((state) => {
 			connected = state.isWebSocketConnected;
@@ -153,7 +233,15 @@
 	let historyCompletion: ((navigation: BeforeNavigate) => void) | null = null;
 	let navigationError = $state<string | null>(null);
 	let navigationAttempt = 0;
-	const editable = $derived(persistence.editable && !leaving);
+	const stateReconciled = $derived(
+		Boolean(
+			auth.isAuthenticated &&
+			metadata.data &&
+			!metadata.error &&
+			persistence.confirmed.revision >= metadata.data.revision
+		)
+	);
+	const editable = $derived(persistence.editable && !leaving && stateReconciled && notifiedVisible);
 	let changesSaved = $state(false);
 	let savingOperation: string | null = null;
 	$effect(() => {
@@ -189,6 +277,8 @@
 				urgent: true,
 				actions: [{ label: 'Retry', run: retrySave }, ...departure]
 			};
+		if (persistence.selectionLimitError)
+			return { message: persistence.selectionLimitError, urgent: true, actions: departure };
 		if (metadata.error)
 			return {
 				message: 'We couldn’t check the latest contract state. Your changes are still here.',
@@ -199,7 +289,10 @@
 			return {
 				message: navigationError,
 				urgent: true,
-				actions: [{ label: 'Retry', run: () => void depart() }, ...departure]
+				actions: [
+					{ label: 'Retry', run: () => void (destination ? depart() : loadLatest()) },
+					...departure
+				]
 			};
 		if (!connected)
 			return {
@@ -221,7 +314,10 @@
 		const target = destination;
 		leaving = true;
 		navigationError = null;
-		if (discard) persistence.pause();
+		if (discard) {
+			persistence.pause();
+			persistence.discard();
+		}
 		if (!discard && !(await persistence.flush())) {
 			if (active && attempt === navigationAttempt) leaving = false;
 			return;
@@ -252,18 +348,24 @@
 			if (active && attempt === navigationAttempt) {
 				allowNavigation = false;
 				leaving = false;
-				persistence.resume();
+				resumeSaving();
 			}
 		}
 	}
 	async function loadLatest() {
-		navigationAttempt++;
+		const attempt = ++navigationAttempt;
 		destination = null;
 		navigationError = null;
 		leaving = false;
-		await persistence.loadLatest();
+		if (!(await persistence.loadLatest()) && active && attempt === navigationAttempt)
+			navigationError = 'We couldn’t load the latest contract state. Your changes are still here.';
 	}
 	beforeNavigate((navigation) => {
+		if (session.closing) return;
+		if (session.blocked && !navigation.willUnload) {
+			navigation.cancel();
+			return;
+		}
 		if (allowNavigation) {
 			historyCompletion?.(navigation);
 			return;
@@ -288,7 +390,7 @@
 		void depart();
 	});
 	function warnBeforeUnload(event: BeforeUnloadEvent) {
-		if (!persistence.pending || persistence.deleted || allowNavigation) return;
+		if (!persistence.pending || persistence.deleted || allowNavigation || session.closing) return;
 		event.preventDefault();
 		event.returnValue = '';
 	}
@@ -343,6 +445,33 @@
 		selectedItemId = null;
 		selectedAnnotationId = null;
 	}
+	const approvalCount = $derived(
+		snapshot.items.filter((item) => requiresApproval([item], persistence.choices)).length
+	);
+	const approvalNeeded = $derived(approvalCount > 0);
+	const matchingApproval = $derived(
+		latestApproval &&
+			latestApproval.companyName === persistence.confirmed.companyName &&
+			matchesApprovalSelection(
+				snapshot.items,
+				persistence.choices,
+				latestApproval.selectedConcessions
+			)
+			? latestApproval
+			: null
+	);
+	const approvalSending = $derived(requestingApproval || latestApproval?.status === 'sending');
+	const approvalRequested = $derived(matchingApproval?.status === 'sent');
+	const approvalRetryBlocked = $derived(
+		latestApproval &&
+			['failed', 'uncertain'].includes(latestApproval.status) &&
+			!latestApproval.retryEligible
+	);
+	$effect(() => {
+		persistence.choices;
+		persistence.confirmed.companyName;
+		approvalError = null;
+	});
 	let exportError = $state<string | null>(null);
 	type WordInput = {
 		source: ContractRenderSource;
@@ -355,7 +484,8 @@
 	const preparingWord = $derived(wordAttempt !== null);
 	let preparedWord = $state.raw<{ input: WordInput; url: string } | null>(null);
 	const savedExportInput = $derived.by<WordInput | null>(() => {
-		if (persistence.pending || persistence.deleted || !source.renderSource) return null;
+		if (approvalNeeded || persistence.pending || persistence.deleted || !source.renderSource)
+			return null;
 		return {
 			source: source.renderSource,
 			concessions: Object.freeze({ ...persistence.confirmed.selectedConcessions }),
@@ -370,6 +500,7 @@
 			persistence.error ||
 			persistence.conflict ||
 			persistence.deleted ||
+			!stateReconciled ||
 			metadata.error ||
 			!connected ||
 			source.issue ||
@@ -392,7 +523,31 @@
 			return null;
 		return rendered;
 	});
-	const exportSnapshot = $derived(preparingWord ? null : eligibleExportSnapshot);
+	const exportSnapshot = $derived(preparingWord || approvalNeeded ? null : eligibleExportSnapshot);
+	const canRequestApproval = $derived(
+		approvalNeeded &&
+			Boolean(eligibleExportSnapshot) &&
+			approvalQuery.data !== undefined &&
+			!approvalQuery.error &&
+			!approvalSending &&
+			!approvalRetryBlocked &&
+			!approvalRequested
+	);
+	async function askForApproval() {
+		if (!active || session.blocked || !canRequestApproval) return;
+		requestingApproval = true;
+		approvalError = null;
+		try {
+			await client.mutation(api.approvals.request, {
+				id: contractId,
+				expectedRevision: persistence.confirmed.revision
+			});
+		} catch (error) {
+			if (active) approvalError = saveError(error, 'We couldn’t request approval. Try again.');
+		} finally {
+			if (active) requestingApproval = false;
+		}
+	}
 	function sameWordInput(a: WordInput | null, b: WordInput | null): boolean {
 		return (
 			a === b ||
@@ -414,7 +569,7 @@
 	}
 	$effect(() => {
 		const input = savedExportInput;
-		const rendered = eligibleExportSnapshot;
+		const rendered = approvalNeeded ? null : eligibleExportSnapshot;
 		untrack(() => {
 			if (!sameWordInput(wordInput, input)) {
 				invalidateWord();
@@ -483,6 +638,13 @@
 
 <svelte:window onbeforeunload={warnBeforeUnload} />
 <WorkspaceChrome {feedback} />
+{#if journal.memoryOnly && persistence.pending}<p
+		role="alert"
+		class="mx-auto mt-4 max-w-3xl rounded-md border border-line bg-surface p-3 text-sm"
+	>
+		Browser storage is unavailable. Your unsaved selections can be recovered while this page stays
+		open; reloading or closing it may lose them.
+	</p>{/if}
 {#if persistence.deleted}<p
 		role="alert"
 		class="mx-auto mt-4 max-w-3xl rounded-md border border-line bg-surface p-3 text-sm"
@@ -493,8 +655,13 @@
 		role="alert"
 		class="mx-auto mt-4 max-w-3xl rounded-md border border-line bg-surface p-3 text-sm"
 	>
-		This contract changed elsewhere. Load the latest version to continue.
-		<button class="ml-2 underline" onclick={() => void loadLatest()}>Load latest</button>
+		This contract changed elsewhere. Choose which selections to keep.
+		<button class="ml-2 underline" onclick={() => void loadLatest()}
+			>Use latest saved version</button
+		>
+		<button class="ml-2 underline" onclick={() => persistence.applyRecovered()}
+			>Apply my selections</button
+		>
 		{#if destination}<button class="ml-2 underline" onclick={() => void depart(true)}
 				>Leave and discard changes</button
 			>{/if}
@@ -517,27 +684,29 @@
 			<div
 				class="pt-6"
 				role="group"
-				aria-label="Contract downloads"
-				aria-busy={preparingWord}
+				aria-label="Contract actions"
+				aria-busy={preparingWord || approvalSending}
 			>
 				<div class="flex flex-wrap justify-center gap-3">
-					<span
-						class="group/pdf relative inline-flex focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-accent"
-						role="button"
-						tabindex="0"
-						aria-disabled="true"
-						aria-label="Download as .pdf. PDF downloads are coming"
+					<button
+						type="button"
+						class={actionButtonClass}
+						disabled={!canRequestApproval}
+						aria-live="polite"
+						onclick={askForApproval}
 					>
-						<button
-							type="button"
-							class={`${actionButtonClass} pointer-events-none`}
-							disabled>Download as .pdf</button
-						>
-						<span
-							role="tooltip"
-							class="pointer-events-none absolute bottom-full left-1/2 z-10 mb-2 hidden w-max max-w-72 -translate-x-1/2 rounded-base bg-ink-secondary px-2.5 py-2 text-xs leading-[1.4] text-surface group-hover/pdf:block group-focus-visible/pdf:block"
-						>PDF downloads are coming</span>
-					</span>
+						{approvalSending
+							? 'Sending approval request…'
+							: approvalRequested
+								? 'Approval requested'
+								: latestApproval?.status === 'uncertain'
+									? latestApproval.retryEligible
+										? 'Retry approval request'
+										: 'Approval delivery uncertain'
+									: matchingApproval?.status === 'failed'
+										? 'Retry approval request'
+										: 'Ask for approval'}
+					</button>
 					<button
 						type="button"
 						class={actionButtonClass}
@@ -545,6 +714,28 @@
 						onclick={downloadPreparedWord}>Download as .docx</button
 					>
 				</div>
+				{#if approvalError || approvalQuery.error || (!approvalSending && (matchingApproval?.status === 'failed' || latestApproval?.status === 'uncertain'))}
+					<p class="mt-3 text-center text-sm text-ink-muted" role="alert">
+						{approvalError ??
+							(approvalQuery.error
+								? 'We couldn’t check approval request status. Reconnect or reload to try again.'
+								: latestApproval?.status === 'uncertain'
+									? latestApproval.retryEligible
+										? 'Gmail delivery could not be confirmed. You can retry now; another request may deliver a duplicate email.'
+										: latestApproval.error
+									: matchingApproval?.error)}
+					</p>
+				{:else if !approvalSending && approvalRequested}
+					<p class="mt-3 text-center text-sm text-ink-muted/60" role="status">
+						Approval request sent to Ben.
+					</p>
+				{/if}
+				{#if approvalNeeded && !approvalRequested}
+					<p class="mt-3 text-center text-sm text-ink-muted">
+						{approvalCount === 1 ? 'This concession requires' : 'These concessions require'} approval
+						before download.
+					</p>
+				{/if}
 				{#if preparingWord}
 					<p class="mt-3 text-center text-sm text-ink-muted" role="status">
 						Preparing Word download…
@@ -556,6 +747,7 @@
 		{/snippet}
 		<DocumentViewerSlot
 			entry={resource}
+			interactive={stateReconciled && (notifiedVisible || Boolean(workspace.renderer.error))}
 			hasPanel={Boolean(item)}
 			{panelContent}
 			{footerContent}

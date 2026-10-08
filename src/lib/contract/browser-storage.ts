@@ -1,13 +1,8 @@
 import { browser } from '$app/environment';
 import { env } from '$env/dynamic/public';
-import type { FunctionReturnType } from 'convex/server';
-import type { api } from '../../convex/_generated/api';
-
-export type CachedCard = FunctionReturnType<typeof api.savedContracts.browse>['page'][number];
-export const CACHE_NAMESPACE = `agreed:v1:${env.PUBLIC_CONVEX_URL ?? ''}`;
-const CARDS_KEY = `${CACHE_NAMESPACE}:cards`;
-const OPENINGS_KEY = `${CACHE_NAMESPACE}:openings`;
-const DAY = 24 * 60 * 60 * 1000;
+import type { SavedContractCard } from './card';
+export let CACHE_NAMESPACE = `agreed:v2:${env.PUBLIC_CONVEX_URL ?? ''}:anonymous`;
+const openingsKey = () => `${CACHE_NAMESPACE}:openings`;
 type Opening = { id: string; openedAt: number };
 let openings: Opening[] | undefined;
 
@@ -25,53 +20,10 @@ function write(key: string, value: unknown) {
 		/* Optional cache. */
 	}
 }
-function isCard(value: unknown): value is CachedCard {
-	if (!value || typeof value !== 'object') return false;
-	const card = value as CachedCard;
-	return (
-		typeof card._id === 'string' &&
-		typeof card.companyName === 'string' &&
-		Number.isFinite(card.savedAt) &&
-		!Number.isNaN(new Date(card.savedAt).getTime()) &&
-		!!card.creator &&
-		typeof card.creator.name === 'string' &&
-		(card.creator.avatarUrl === null || typeof card.creator.avatarUrl === 'string')
-	);
-}
-export function readCachedCards(): CachedCard[] {
-	const entry = read(CARDS_KEY) as { savedAt?: number; cards?: unknown[] } | null;
-	if (
-		!entry ||
-		!Number.isFinite(entry.savedAt) ||
-		Date.now() - entry.savedAt! > DAY ||
-		entry.savedAt! > Date.now() ||
-		!Array.isArray(entry.cards) ||
-		entry.cards.length > 24 ||
-		!entry.cards.every(isCard)
-	)
-		return [];
-	return entry.cards;
-}
-export function storeCards(cards: readonly CachedCard[]) {
-	write(CARDS_KEY, { savedAt: Date.now(), cards: cards.slice(0, 24) });
-}
-export function reconcileCards(id: string, companyName?: string) {
-	const cards = readCachedCards();
-	const previous = read(CARDS_KEY) as { savedAt?: number } | null;
-	write(CARDS_KEY, {
-		savedAt: previous?.savedAt ?? Date.now(),
-		cards:
-			companyName === undefined
-				? cards.filter((card) => card._id !== id)
-				: cards.map((card) =>
-						card._id === id ? { ...card, companyName, savedAt: Date.now() } : card
-					)
-	});
-}
 export function recentOpenings(): readonly Opening[] {
 	if (!browser) return [];
 	if (!openings) {
-		const value = read(OPENINGS_KEY);
+		const value = read(openingsKey());
 		openings = Array.isArray(value)
 			? value
 					.filter(
@@ -89,15 +41,15 @@ export function recordOpening(id: string) {
 		{ id, openedAt: Date.now() },
 		...recentOpenings().filter((entry) => entry.id !== id)
 	].slice(0, 50);
-	write(OPENINGS_KEY, openings);
+	write(openingsKey(), openings);
 }
 export function forgetOpening(id: string) {
 	openings = recentOpenings().filter((entry) => entry.id !== id);
-	write(OPENINGS_KEY, openings);
+	write(openingsKey(), openings);
 }
 /** Preparation order only; Home keeps the server's display order. */
 export function rankCards(
-	cards: readonly CachedCard[],
+	cards: readonly SavedContractCard[],
 	promoted: readonly string[] = []
 ): string[] {
 	const history = new Map(recentOpenings().map((entry) => [entry.id, entry.openedAt]));
@@ -111,4 +63,25 @@ export function rankCards(
 				a.order - b.order
 		)
 		.map(({ card }) => card._id);
+}
+
+export function setCacheIdentity(identity: string | null) {
+	const next = `agreed:v2:${env.PUBLIC_CONVEX_URL ?? ''}:${identity ?? 'anonymous'}`;
+	if (next === CACHE_NAMESPACE) return;
+	if (browser) {
+		try {
+			localStorage.removeItem(`${CACHE_NAMESPACE}:cards`);
+			localStorage.removeItem(openingsKey());
+			// Discard the former anonymous caches as well as the previous session.
+			const old = `agreed:v1:${env.PUBLIC_CONVEX_URL ?? ''}`;
+			localStorage.removeItem(`${old}:cards`);
+			localStorage.removeItem(`${old}:openings`);
+			indexedDB.deleteDatabase(`${old}:snapshots`);
+			indexedDB.deleteDatabase(`${CACHE_NAMESPACE}:snapshots`);
+		} catch {
+			/* Optional cache. */
+		}
+	}
+	openings = undefined;
+	CACHE_NAMESPACE = next;
 }

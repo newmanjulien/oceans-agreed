@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { env } from '$env/dynamic/public';
+	import { navigating } from '$app/state';
 	import { onDestroy, onMount, untrack } from 'svelte';
-	import { readCachedCards, storeCards, type CachedCard } from '$lib/contract/browser-storage';
+	import type { SavedContractCard } from '$lib/contract/card';
+	import { afterStartupPaint, recordStartup } from '$lib/auth/startup-perf';
 	import { createVisibleContractWarming } from '$lib/contract/visible-contracts.svelte';
 	import { getContractSnapshotCache } from '$lib/contract/snapshot-cache';
 	import { useConvexClient, usePaginatedQuery } from 'convex-svelte';
@@ -11,6 +13,8 @@
 	import CompanyNameDialog from '$lib/components/ui/modal/CompanyNameDialog.svelte';
 	import type { Id } from '../../convex/_generated/dataModel';
 	import { saveError } from '$lib/contract/saved';
+	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import { ConnectionInterruptedError } from '$lib/auth/convex-session.svelte';
 	import MagnifyingGlassIcon from 'phosphor-svelte/lib/MagnifyingGlassIcon';
 	import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
 	import XIcon from 'phosphor-svelte/lib/XIcon';
@@ -18,6 +22,12 @@
 	setInteractionOwner(Symbol('home'));
 	const interactions = getInteractionController();
 	const client = env.PUBLIC_CONVEX_URL ? useConvexClient() : null;
+	const cache = getContractSnapshotCache();
+	const session = useViewerSession();
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+	});
 	const warming = createVisibleContractWarming();
 	onDestroy(() => warming.destroy());
 	let search = $state('');
@@ -40,7 +50,7 @@
 		return () => clearTimeout(timer);
 	});
 	const pendingSearch = $derived(search.trim() !== query);
-	let retained = $state.raw<CachedCard[]>([]);
+	let retained = $state.raw<SavedContractCard[]>([]);
 	let settledQuery = $state<string | null>(null);
 	function handleTyping(event: KeyboardEvent) {
 		if (
@@ -69,7 +79,6 @@
 		searchInput.dispatchEvent(new Event('input', { bubbles: true }));
 	}
 	onMount(() => {
-		if (settledQuery === null) retained = readCachedCards();
 		return interactions.shortcut(handleTyping);
 	});
 	const waiting = $derived(
@@ -91,34 +100,53 @@
 		const results = contracts.results;
 		const currentQuery = query;
 		untrack(() => {
-			retained = results.filter((card) => !getContractSnapshotCache().isDeleted(card._id));
+			retained = results.filter((card) => !cache.isDeleted(card._id));
 			settledQuery = currentQuery;
-			if (!currentQuery) storeCards(retained);
 		});
 	});
 	$effect(() => {
-		const pending = waiting;
+		const pending = waiting || session.blocked || Boolean(navigating.to);
 		untrack(() => warming.pending(pending));
 	});
+	let firstResult = $state(false);
+	$effect(() => {
+		const ready = Boolean(contracts && !contracts.error && contracts.status !== 'LoadingFirstPage');
+		const failure = contracts?.error?.message ?? '';
+		untrack(() => {
+			if (!firstResult) {
+				session.reportDestination(ready, failure);
+				if (ready) firstResult = true;
+			}
+		});
+	});
+	$effect(() => {
+		if (!session.admitted || !firstResult) return;
+		return afterStartupPaint(() => recordStartup('dashboard-painted'));
+	});
 	async function rename(name: string) {
-		if (!client || !renaming || busy) return;
+		if (!alive || session.blocked || !client || !renaming || busy) return;
+		const id = renaming.id;
+		const generation = session.transportGeneration;
 		busy = true;
 		renameError = null;
 		try {
-			await client.mutation(api.savedContracts.rename, { id: renaming.id, companyName: name });
-			getContractSnapshotCache().rename(renaming.id, name);
+			await client.mutation(api.savedContracts.rename, { id, companyName: name });
+			if (!alive) return;
+			if (session.transportGeneration !== generation) throw new ConnectionInterruptedError();
+			cache.rename(id, name);
 			retained = retained.map((card) =>
-				card._id === renaming!.id ? { ...card, companyName: name, savedAt: Date.now() } : card
+				card._id === id ? { ...card, companyName: name, savedAt: Date.now() } : card
 			);
 			renaming = null;
 		} catch (error) {
-			renameError = saveError(error, 'We couldn’t rename this contract. Try again.');
+			if (alive) renameError = saveError(error, 'We couldn’t rename this contract. Try again.');
 		} finally {
-			busy = false;
+			if (alive) busy = false;
 		}
 	}
 	async function remove(id: Id<'savedContracts'>, name: string) {
-		if (!client || deleting) return;
+		if (!alive || session.blocked || !client || deleting) return;
+		const generation = session.transportGeneration;
 		if (
 			!window.confirm(
 				`Delete the contract for “${name}”? This permanently removes its saved choices and document snapshot.`
@@ -129,12 +157,14 @@
 		actionError = null;
 		try {
 			await client.mutation(api.savedContracts.remove, { id });
-			getContractSnapshotCache().remove(id);
+			if (!alive) return;
+			if (session.transportGeneration !== generation) throw new ConnectionInterruptedError();
+			cache.remove(id);
 			retained = retained.filter((card) => card._id !== id);
 		} catch (error) {
-			actionError = saveError(error, 'We couldn’t delete this contract. Try again.');
+			if (alive) actionError = saveError(error, 'We couldn’t delete this contract. Try again.');
 		} finally {
-			deleting = null;
+			if (alive) deleting = null;
 		}
 	}
 </script>
@@ -202,35 +232,23 @@
 				<p>We couldn’t load your contracts.</p>
 				<button
 					onclick={() => window.location.reload()}
-					class="mt-4 rounded-button-lg border border-line bg-surface px-4 py-2 text-sm">Try again</button
+					class="mt-4 rounded-button-lg border border-line bg-surface px-4 py-2 text-sm"
+					>Try again</button
 				>
 			</div>
-		{:else if waiting && cards.length === 0}
-			<div class="cards" aria-label="Loading contracts" aria-busy="true">
-				{#each Array(8) as _}<div
-						aria-hidden="true"
-						class="flex min-h-[98px] flex-col justify-between gap-1.5 animate-pulse rounded-xl border border-[#e5e5e5] bg-white p-3 pr-10 motion-reduce:animate-none"
-					>
-						<div class="h-5 w-2/3 rounded bg-[#f0f0f0]"></div>
-						<div class="flex items-center gap-2">
-							<div class="size-5 shrink-0 rounded-full bg-[#f0f0f0]"></div>
-							<div class="h-3 w-1/2 rounded bg-[#f0f0f0]"></div>
-						</div>
-						<div class="h-4 w-2/3 rounded bg-[#f0f0f0]"></div>
-					</div>{/each}
-			</div>
-			<p class="sr-only" role="status">Loading contracts…</p>
-		{:else if cards.length === 0 && !waiting}
+		{:else if cards.length === 0 && !waiting && contracts?.status === 'Exhausted'}
 			<div class="state" role="status">
 				{#if query}<h2 class="text-[13px] font-medium">No contracts found</h2>
 					<p class="mt-2 text-[13px] text-ink-muted">No company names match “{query}”.</p>
-					<button onclick={() => (search = '')} class="mt-4 text-[13px] underline">Clear search</button>
+					<button onclick={() => (search = '')} class="mt-4 text-[13px] underline"
+						>Clear search</button
+					>
 				{:else}<h2 class="text-[13px] font-medium">No contracts yet</h2>
 					<p class="mt-2 text-[13px] text-ink-muted">
 						Select Add New to start your first contract.
 					</p>{/if}
 			</div>
-		{:else}
+		{:else if cards.length}
 			<div class="cards">
 				{#each cards as contract (contract._id)}
 					<ContractCard
@@ -247,18 +265,18 @@
 					/>
 				{/each}
 			</div>
-			{#if contracts && contracts.status !== 'Exhausted'}<div class="mt-6 flex justify-center">
-					<button
-						disabled={waiting ||
-							Boolean(contracts.error) ||
-							settledQuery !== query ||
-							contracts.status === 'LoadingMore'}
-						onclick={() => contracts.loadMore(24)}
-						class="rounded-button-lg border border-[#e5e5e5] bg-white px-4 py-2 text-sm disabled:opacity-50"
-						>{contracts.status === 'LoadingMore' ? 'Loading…' : 'Load more'}</button
-					>
-				</div>{/if}
 		{/if}
+		{#if contracts && contracts.status !== 'Exhausted'}<div class="mt-6 flex justify-center">
+				<button
+					disabled={waiting ||
+						Boolean(contracts.error) ||
+						settledQuery !== query ||
+						contracts.status === 'LoadingMore'}
+					onclick={() => contracts.loadMore(24)}
+					class="rounded-button-lg border border-[#e5e5e5] bg-white px-4 py-2 text-sm disabled:opacity-50"
+					>{contracts.status === 'LoadingMore' ? 'Loading…' : 'Load more'}</button
+				>
+			</div>{/if}
 	</div>
 </main>
 {#if renaming}<CompanyNameDialog

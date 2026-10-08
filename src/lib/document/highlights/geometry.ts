@@ -55,6 +55,7 @@ export interface MeasuredInterval {
 	right: number;
 	kind: HighlightKind;
 	owner?: HTMLElement;
+	annotationIds?: readonly string[];
 }
 
 /** Endpoint ancestors bound membership without probing a range against every page. */
@@ -333,12 +334,21 @@ export function measureRevisions(pages: PageGeometry[]): MeasuredInterval[] {
 }
 
 export function measureTriggers(pages: PageGeometry[]): MeasuredInterval[] {
+	const memberships = new Map<HTMLElement, readonly string[]>();
+	const annotationIds = (owner: HTMLElement) => {
+		const cached = memberships.get(owner);
+		if (cached) return cached;
+		const ids: readonly string[] = JSON.parse(owner.dataset.annotationMemberships ?? '[]');
+		memberships.set(owner, ids);
+		return ids;
+	};
 	return pages.flatMap((page) =>
 		page.containers.flatMap((container) => {
 			const intervals: MeasuredInterval[] = [];
 			for (const entry of container.texts) {
 				const owner = entry.trigger;
 				if (!owner || owner.closest('.is-empty-insertion-slot')) continue;
+				const ids = annotationIds(owner);
 				for (const rect of entry.rects)
 					intervals.push({
 						page,
@@ -347,7 +357,8 @@ export function measureTriggers(pages: PageGeometry[]): MeasuredInterval[] {
 						left: rect.left,
 						right: rect.right,
 						kind: 'trigger',
-						owner
+						owner,
+						annotationIds: ids
 					});
 			}
 			// Empty insertion slots have no text rectangles and occupy a full line.
@@ -368,7 +379,8 @@ export function measureTriggers(pages: PageGeometry[]): MeasuredInterval[] {
 					left: (box.left - bounds.left) / scale,
 					right: (box.right - bounds.left) / scale,
 					kind: 'trigger',
-					owner
+					owner,
+					annotationIds: annotationIds(owner)
 				});
 			}
 			return mergeIntervals(intervals);
@@ -400,7 +412,7 @@ function mergeIntervals(intervals: MeasuredInterval[]): MeasuredInterval[] {
 /** Subtract within vertically overlapping groups on each page before painting. */
 export function resolveOverlaps(
 	intervals: MeasuredInterval[],
-	hoveredOwner: HTMLElement | null = null
+	hoveredAnnotationId: string | null = null
 ): HighlightRect[] {
 	const pages = new Map<PageGeometry, MeasuredInterval[]>();
 	for (const interval of intervals) {
@@ -419,13 +431,13 @@ export function resolveOverlaps(
 			groups.at(-1)!.push(interval);
 			bottom = Math.max(bottom, interval.band.y + interval.band.height);
 		}
-		return groups.flatMap((group) => subtractGroup(group, hoveredOwner));
+		return groups.flatMap((group) => subtractGroup(group, hoveredAnnotationId));
 	});
 }
 
 function subtractGroup(
 	intervals: MeasuredInterval[],
-	hoveredOwner: HTMLElement | null
+	hoveredAnnotationId: string | null
 ): HighlightRect[] {
 	type Piece = { interval: MeasuredInterval; x: number; y: number; width: number; height: number };
 	const result: Piece[] = [];
@@ -470,7 +482,8 @@ function subtractGroup(
 						triggerState:
 							owner.getAttribute('aria-pressed') === 'true'
 								? ('selected' as const)
-								: owner === hoveredOwner
+								: hoveredAnnotationId !== null &&
+									  interval.annotationIds?.includes(hoveredAnnotationId)
 									? ('hover' as const)
 									: ('default' as const)
 					}

@@ -1,4 +1,5 @@
 import { sameSelection } from '$lib/playbook/model';
+import { MAX_SELECTED_CONCESSIONS } from './selection-limits';
 import {
 	saveError,
 	type ContractSaveResult,
@@ -6,6 +7,7 @@ import {
 	type SavedSelections
 } from './saved';
 import type { Id } from '../../convex/_generated/dataModel';
+import type { ContractDraft } from './draft-recovery.svelte';
 
 export type ContractSaveRequest = {
 	id: Id<'savedContracts'>;
@@ -20,37 +22,83 @@ export class ContractPersistence {
 	choices = $state.raw<SavedSelections>({});
 	request = $state.raw<ContractSaveRequest | null>(null);
 	error = $state<string | null>(null);
+	selectionLimitError = $state<string | null>(null);
 	conflict = $state(false);
 	deleted = $state(false);
+	recoveryPending = $state(false);
 	private running: Promise<void> | null = null;
 	private active = true;
 	private paused = false;
+	private frozen = false;
+	private loadingLatest = false;
+	private transportGeneration = 0;
+	private recovery: ContractDraft | null;
 
 	constructor(
 		private id: Id<'savedContracts'>,
 		initial: ContractState,
-		private save: (request: ContractSaveRequest) => Promise<ContractSaveResult>
+		private save: (request: ContractSaveRequest) => Promise<ContractSaveResult>,
+		private checkpoint: (draft: ContractDraft | null) => void = () => {},
+		recovery: ContractDraft | null = null
 	) {
 		this.confirmed = $state.raw(initial);
 		this.choices = { ...initial.selectedConcessions };
+		this.recovery = recovery;
+		this.recoveryPending = !!recovery;
+		if (recovery) this.choices = { ...recovery.choices };
 	}
 
 	get pending() {
 		return (
-			Boolean(this.request) || !sameSelection(this.choices, this.confirmed.selectedConcessions)
+			this.recoveryPending ||
+			this.conflict ||
+			Boolean(this.request) ||
+			!sameSelection(this.choices, this.confirmed.selectedConcessions)
 		);
 	}
 	get editable() {
-		return this.active && !this.paused && !this.conflict && !this.deleted;
+		return this.canSave && !this.frozen;
+	}
+	private get canSave() {
+		return (
+			this.active &&
+			!this.paused &&
+			!this.loadingLatest &&
+			!this.conflict &&
+			!this.deleted &&
+			!this.recoveryPending
+		);
+	}
+	private record() {
+		if (this.recoveryPending) return;
+		this.checkpoint(
+			this.deleted || !this.pending
+				? null
+				: {
+						version: 1,
+						base: this.confirmed,
+						choices: this.choices,
+						request: this.request,
+						conflict: this.conflict
+					}
+		);
 	}
 
 	select(itemId: Id<'playbookItems'>, concessionId: string | null) {
 		if (!this.editable) return;
 		const next = { ...this.choices };
 		if (concessionId === null || next[itemId] === concessionId) delete next[itemId];
-		else next[itemId] = concessionId;
+		else {
+			if (!Object.hasOwn(next, itemId) && Object.keys(next).length >= MAX_SELECTED_CONCESSIONS) {
+				this.showSelectionLimit();
+				return;
+			}
+			next[itemId] = concessionId;
+		}
+		this.selectionLimitError = null;
 		if (sameSelection(next, this.choices)) return;
 		this.choices = next;
+		this.record();
 		this.start();
 	}
 
@@ -58,6 +106,13 @@ export class ContractPersistence {
 		if (!this.active || this.deleted) return;
 		if (next === null) {
 			this.deleted = true;
+			this.recoveryPending = false;
+			this.recovery = null;
+			this.record();
+			return;
+		}
+		if (this.recoveryPending) {
+			this.restore(next);
 			return;
 		}
 		if (next.revision < this.confirmed.revision) return;
@@ -72,12 +127,57 @@ export class ContractPersistence {
 			this.error = null;
 			this.start();
 		}
+		this.record();
+	}
+	private restore(next: ContractState) {
+		const draft = this.recovery!;
+		this.recovery = null;
+		this.recoveryPending = false;
+		this.confirmed = next;
+		this.choices = { ...draft.choices };
+		this.request = draft.request;
+		this.conflict = draft.conflict;
+		if (draft.request && next.lastOperationId === draft.request.operationId) {
+			// The interrupted operation committed; only newer local choices remain.
+			this.request = null;
+		} else if (draft.request) {
+			// Equality of the latest choices is not an acknowledgement of this request.
+			// Replay its immutable arguments before saving any newer intent.
+			if (next.revision !== draft.request.expectedRevision) this.conflict = true;
+		} else if (
+			next.revision !== draft.base.revision &&
+			!sameSelection(this.choices, next.selectedConcessions)
+		)
+			this.conflict = true;
+		this.record();
+		this.start();
+	}
+	applyRecovered() {
+		if (
+			!this.active ||
+			!this.conflict ||
+			this.deleted ||
+			this.running ||
+			this.recoveryPending ||
+			this.loadingLatest
+		)
+			return;
+		this.request = null;
+		this.conflict = false;
+		this.error = null;
+		this.record();
+		this.start();
 	}
 
 	private start() {
-		if (!this.editable || this.running || this.error) return;
+		if (!this.canSave || this.running || this.error) return;
 		if (!this.request) {
 			if (!this.pending) return;
+			if (Object.keys(this.choices).length > MAX_SELECTED_CONCESSIONS) {
+				this.showSelectionLimit();
+				return;
+			}
+			this.selectionLimitError = null;
 			this.request = {
 				id: this.id,
 				selectedConcessions: { ...this.choices },
@@ -86,16 +186,25 @@ export class ContractPersistence {
 			};
 		}
 		const request = this.request;
+		this.record();
 		// Keep exactly one immutable operation until it is acknowledged or explicitly discarded.
-		this.running = this.send(request);
+		this.running = this.send(request, this.transportGeneration);
 	}
 
-	private async send(request: ContractSaveRequest) {
+	private showSelectionLimit() {
+		this.selectionLimitError = `You can select up to ${MAX_SELECTED_CONCESSIONS.toLocaleString('en-US')} concessions. Remove a selection before adding another.`;
+	}
+
+	private async send(request: ContractSaveRequest, generation: number) {
 		// Yield so `running` is assigned even if the transport throws synchronously.
 		await Promise.resolve();
+		if (!this.active || generation !== this.transportGeneration || this.paused) {
+			if (generation === this.transportGeneration) this.running = null;
+			return;
+		}
 		try {
 			const result = await this.save(request);
-			if (!this.active) return;
+			if (!this.active || generation !== this.transportGeneration) return;
 			if (result.status === 'deleted') this.deleted = true;
 			else {
 				// A subscription may already include a later rename at the same revision.
@@ -104,7 +213,7 @@ export class ContractPersistence {
 			}
 			this.request = null;
 		} catch (cause) {
-			if (!this.active) return;
+			if (!this.active || generation !== this.transportGeneration) return;
 			if (this.confirmed.lastOperationId === request.operationId) this.request = null;
 			else
 				this.error = saveError(
@@ -112,13 +221,16 @@ export class ContractPersistence {
 					'We couldn’t save this contract. Your changes are still here.'
 				);
 		} finally {
-			this.running = null;
-			if (this.active) this.start();
+			if (generation === this.transportGeneration) {
+				this.running = null;
+				this.record();
+				if (this.active) this.start();
+			}
 		}
 	}
 
 	retry() {
-		if (!this.editable || this.running) return;
+		if (!this.canSave || this.running) return;
 		this.error = null;
 		this.start();
 	}
@@ -126,12 +238,61 @@ export class ContractPersistence {
 	async loadLatest() {
 		// A request already handed to Convex cannot be cancelled. Wait for its outcome
 		// before discarding intent so a late acknowledgement cannot start another save.
-		if (this.running) await this.running;
-		if (!this.active || this.deleted) return;
+		if (!this.active || this.deleted || this.recoveryPending || this.loadingLatest) return false;
+		const generation = this.transportGeneration;
+		this.loadingLatest = true;
+		try {
+			if (this.running) await this.running;
+			if (
+				!this.active ||
+				this.deleted ||
+				generation !== this.transportGeneration ||
+				this.recoveryPending ||
+				(this.request && this.confirmed.revision <= this.request.expectedRevision)
+			)
+				return false;
+			// A newer revision prevents the old request from changing the server again.
+			this.request = null;
+			this.error = null;
+			this.conflict = false;
+			this.selectionLimitError = null;
+			this.choices = { ...this.confirmed.selectedConcessions };
+			this.record();
+			return true;
+		} finally {
+			this.loadingLatest = false;
+			this.start();
+		}
+	}
+	freeze(frozen: boolean) {
+		this.frozen = frozen;
+	}
+	/** An old client may have committed a request without delivering its response. */
+	restartTransport() {
+		this.transportGeneration++;
+		this.running = null;
+		this.error = null;
+		if (this.pending && !this.recoveryPending) {
+			this.recovery = {
+				version: 1,
+				base: this.confirmed,
+				choices: this.choices,
+				request: this.request,
+				conflict: this.conflict
+			};
+			this.recoveryPending = true;
+		}
+	}
+	discard() {
+		this.transportGeneration++;
+		this.running = null;
+		this.recovery = null;
+		this.recoveryPending = false;
 		this.request = null;
 		this.error = null;
 		this.conflict = false;
 		this.choices = { ...this.confirmed.selectedConcessions };
+		this.checkpoint(null);
 	}
 
 	pause() {
@@ -144,15 +305,26 @@ export class ContractPersistence {
 	}
 
 	async flush() {
+		const generation = this.transportGeneration;
 		while (this.active && !this.deleted && !this.conflict && !this.error && this.pending) {
 			this.start();
 			if (!this.running) return false;
 			await this.running;
+			if (generation !== this.transportGeneration) return false;
 		}
-		return this.active && !this.deleted && !this.conflict && !this.error && !this.pending;
+		return (
+			this.active &&
+			!this.deleted &&
+			!this.conflict &&
+			!this.error &&
+			!this.pending &&
+			!this.recoveryPending
+		);
 	}
 
 	destroy() {
 		this.active = false;
+		this.transportGeneration++;
+		this.running = null;
 	}
 }

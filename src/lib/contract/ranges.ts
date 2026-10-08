@@ -1,10 +1,12 @@
+import { PlaybookValidationError } from '../playbook/validation-error';
 import type { SourcePoint, SourceRange } from './source-model';
 import { pointPosition, resolvePoint, type SourceIndex, type SourceUnit } from './source-index';
 
 export const comparePoints = (index: SourceIndex, a: SourcePoint, b: SourcePoint): number =>
 	Math.sign(pointPosition(index, a) - pointPosition(index, b));
 export function validateRange(index: SourceIndex, range: SourceRange): void {
-	if (comparePoints(index, range.start, range.end) > 0) throw new Error('Source range is reversed');
+	if (comparePoints(index, range.start, range.end) > 0)
+		throw new PlaybookValidationError('Source range is reversed');
 }
 export function isEmptyRange(index: SourceIndex, range: SourceRange): boolean {
 	validateRange(index, range);
@@ -48,7 +50,7 @@ export function localContainer(index: SourceIndex, range: SourceRange): string {
 	const start = resolvePoint(index, range.start),
 		end = resolvePoint(index, range.end);
 	if (start.containerKey !== end.containerKey)
-		throw new Error('Edit must target one source container');
+		throw new PlaybookValidationError('Edit must target one source container');
 	return start.containerKey;
 }
 export function unitsInRange(index: SourceIndex, range: SourceRange): readonly SourceUnit[] {

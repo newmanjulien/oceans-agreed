@@ -1,3 +1,6 @@
+import { PlaybookValidationError } from './validation-error';
+export { PlaybookValidationError } from './validation-error';
+
 import type { SourceIndex } from '../contract/source-index';
 import type { CompiledContract } from '../contract/compiled-contract';
 import type { Concession, ContractChange, PlaybookItem, Trigger } from './model';
@@ -14,9 +17,6 @@ import { equalConcession } from './draft';
 export const MAX_PLAYBOOK_ITEM_BYTES = 500_000;
 export const MAX_PLAYBOOK_ITEMS = 4096;
 export const MAX_CONTRACT_BLOCKS = 4096;
-
-/** Expected save limits can be shown directly; source diagnostics stay separate. */
-export class PlaybookValidationError extends Error {}
 
 export function validateNewConcessions(concessions: readonly Concession[]): void {
 	for (const concession of concessions)
@@ -38,8 +38,8 @@ export function validateConcessionUpdate(saved: PlaybookItem, proposed: Playbook
 }
 
 function unique(seen: Set<string>, id: string, label: string): void {
-	if (!id.trim() || id !== id.trim()) throw new Error(`Invalid ${label}`);
-	if (seen.has(id)) throw new Error(`Duplicate ${label}: ${id}`);
+	if (!id.trim() || id !== id.trim()) throw new PlaybookValidationError(`Invalid ${label}`);
+	if (seen.has(id)) throw new PlaybookValidationError(`Duplicate ${label}: ${id}`);
 	seen.add(id);
 }
 
@@ -51,7 +51,7 @@ export function validateTriggers(index: SourceIndex, triggers: readonly Trigger[
 		validateTriggerRange(index, trigger.range);
 		for (const other of triggers.slice(0, i))
 			if (triggersIntersect(index, other.range, trigger.range))
-				throw new Error(`Overlapping Triggers: ${other.id}, ${trigger.id}`);
+				throw new PlaybookValidationError(`Overlapping Triggers: ${other.id}, ${trigger.id}`);
 	}
 }
 
@@ -66,7 +66,8 @@ export function validateChangeGeometry(
 		changeTriggerOwner(index, triggers, change);
 		activatedBlock(index, change);
 		for (let j = 0; j < i; j++)
-			if (conflicts(changes[j], change)) throw new Error(`Conflicting changes: ${i + 1}`);
+			if (conflicts(changes[j], change))
+				throw new PlaybookValidationError(`Conflicting changes: ${i + 1}`);
 	}
 }
 
@@ -74,12 +75,13 @@ export function validateChangeGeometry(
 export function validatePlaybookItemContent(item: PlaybookItem): void {
 	if (new TextEncoder().encode(JSON.stringify(item)).byteLength > MAX_PLAYBOOK_ITEM_BYTES)
 		throw new PlaybookValidationError('Playbook Item exceeds 500 KB');
-	if (!item.triggers.length) throw new Error('A Playbook Item needs at least one Trigger');
+	if (!item.triggers.length)
+		throw new PlaybookValidationError('A Playbook Item needs at least one Trigger');
 	const concessionIds = new Set<string>();
 	for (const concession of item.concessions) {
 		unique(concessionIds, concession.id, 'concession ID');
 		if (concession.tier !== 'preferred' && concession.tier !== 'rare')
-			throw new Error('Invalid concession tier');
+			throw new PlaybookValidationError('Invalid concession tier');
 	}
 }
 

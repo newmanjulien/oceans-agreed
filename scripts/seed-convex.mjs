@@ -6,6 +6,7 @@ import { ConvexHttpClient } from 'convex/browser';
 import { anyApi } from 'convex/server';
 
 function run(...args) {
+	console.log(`target: ${deployment} (${isLocal ? 'local' : 'personal dev'}), convex ${args[0]}`);
 	const result = spawnSync('npx', ['convex', ...args], { stdio: 'inherit' });
 	if (result.error) throw result.error;
 	if (result.status !== 0) throw new Error(`convex ${args[0]} failed (${result.status}).`);
@@ -61,6 +62,8 @@ const itemStatus = status(before.items, expectedItems, 'playbookItems');
 if (blockStatus === 'complete' && itemStatus === 'missing') {
 	throw new Error('Contract blocks exist but no items remain. Refusing to restore deleted items.');
 }
+// Maintenance stays enabled after an interrupted import; a verified retry finishes it.
+run('run', 'templates:beginImport', '{}', ...target);
 // Import items first so an interrupted initial import can resume without
 // confusing an intentionally empty item table with a fresh deployment.
 if (itemStatus === 'missing') {
@@ -82,6 +85,7 @@ if (
 ) {
 	throw new Error('Contract import is incomplete.');
 }
+run('run', 'templates:finishImport', '{}', ...target);
 console.log(
 	`Seed baseline round trip verified: ${after.blocks.length} blocks, ${after.items.length} items.`
 );

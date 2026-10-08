@@ -1,0 +1,63 @@
+<script lang="ts">
+	import { tick } from 'svelte';
+	import type { HTMLInputAttributes } from 'svelte/elements';
+	import { cn } from '$lib/ui/cn';
+	import { fieldClass } from '$lib/ui/field-styles';
+
+	type Props = {
+		label: string;
+		value: string;
+		placeholder?: string;
+		type?: 'email' | 'text' | 'url';
+		autocomplete?: HTMLInputAttributes['autocomplete'];
+		inputmode?: HTMLInputAttributes['inputmode'];
+		required?: boolean;
+		autofocus?: boolean;
+		invalid?: boolean;
+	};
+
+	let {
+		label,
+		value = $bindable(),
+		placeholder = '',
+		type = 'text',
+		autocomplete,
+		inputmode,
+		required = false,
+		autofocus = false,
+		invalid = false
+	}: Props = $props();
+
+	let inputElement = $state<HTMLInputElement | null>(null);
+
+	$effect(() => {
+		if (!autofocus || !inputElement) {
+			return;
+		}
+
+		tick().then(() => {
+			if (inputElement && !inputElement.value && document.activeElement === document.body)
+				inputElement.focus();
+		});
+	});
+</script>
+
+<label class="block min-w-0">
+	<span class="sr-only">{label}</span>
+	<input
+		bind:this={inputElement}
+		bind:value
+		placeholder={placeholder || label}
+		{type}
+		{autocomplete}
+		{inputmode}
+		{required}
+		aria-invalid={invalid}
+		class={cn(
+			fieldClass,
+			'box-border h-10 leading-none',
+			invalid &&
+				'border-danger/30 bg-danger-surface text-danger focus:border-danger focus-visible:outline-danger/30'
+		)}
+	/>
+</label>

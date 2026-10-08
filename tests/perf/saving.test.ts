@@ -7,14 +7,15 @@ import type { MutationCtx } from '../../src/convex/_generated/server';
 import schema from '../../src/convex/schema';
 import { saveChoices } from '../../src/convex/savedContracts';
 import { CompiledContract } from '../../src/lib/contract/compiled-contract';
-import { block, item } from './fixtures';
+import { block, item, identity, initializeViewer } from './fixtures';
 
 // Spy at the real compiler boundary, retaining its implementation.
 vi.mock('../../src/lib/contract/compiled-contract', { spy: true });
 const modules = import.meta.glob('../../src/convex/**/*.*s');
 
 async function fixture(selected = false) {
-	const t = convexTest(schema, modules);
+	const t = convexTest(schema, modules).withIdentity(identity);
+	const profileId = await t.run(initializeViewer);
 	const ids = await t.run(async ({ db }) => {
 		const first = await db.insert('playbookItems', item);
 		const second = await db.insert('playbookItems', item);
@@ -22,6 +23,7 @@ async function fixture(selected = false) {
 		const choices = { [first]: 'preferred', [second]: 'preferred' };
 		const id = await db.insert('savedContracts', {
 			companyName: 'Synthetic Buyer',
+			creatorId: profileId,
 			savedAt: 123,
 			revision: 7,
 			lastOperationId: 'previous-operation',

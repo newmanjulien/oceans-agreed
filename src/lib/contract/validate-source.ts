@@ -1,20 +1,22 @@
+import { PlaybookValidationError } from '../playbook/validation-error';
 import type { BaselineBlock, ReplacementAtom } from './source-model';
 import { buildSourceIndex } from './source-index';
 
 type Reference = Extract<ReplacementAtom, { kind: 'reference' }>;
 
 function key(value: string, label: string): void {
-	if (!value?.trim() || value !== value.trim()) throw new Error(`Invalid ${label}: ${value}`);
+	if (!value?.trim() || value !== value.trim())
+		throw new PlaybookValidationError(`Invalid ${label}: ${value}`);
 }
 function unique(seen: Set<string>, value: string, label: string): void {
 	key(value, label);
-	if (seen.has(value)) throw new Error(`Duplicate ${label}: ${value}`);
+	if (seen.has(value)) throw new PlaybookValidationError(`Duplicate ${label}: ${value}`);
 	seen.add(value);
 }
 
 /** Immutable source validation, independent of the Playbook and authoring workflow. */
 export function validateBaseline(blocks: readonly BaselineBlock[]) {
-	if (!blocks.length) throw new Error('Contract has no blocks');
+	if (!blocks.length) throw new PlaybookValidationError('Contract has no blocks');
 	const anchors = new Set<string>();
 	const items = new Map<string, { block: BaselineBlock; position: number }>();
 	const sequences = new Map<string, { parent?: string; style: string }>();
@@ -25,16 +27,18 @@ export function validateBaseline(blocks: readonly BaselineBlock[]) {
 			key(item.itemKey, 'numbering item');
 			key(item.sequenceKey, 'numbering sequence');
 			if (items.has(item.itemKey) || block.kind === 'table')
-				throw new Error(`Invalid numbering item: ${item.itemKey}`);
+				throw new PlaybookValidationError(`Invalid numbering item: ${item.itemKey}`);
 			if (item.parentItemKey !== undefined) {
 				key(item.parentItemKey, 'numbering parent');
 				const parent = items.get(item.parentItemKey)?.block;
 				if (!parent || (parent.kind === 'paragraph' && parent.optional))
-					throw new Error(`Missing, late or optional numbering parent: ${item.itemKey}`);
+					throw new PlaybookValidationError(
+						`Missing, late or optional numbering parent: ${item.itemKey}`
+					);
 			}
 			const sequence = sequences.get(item.sequenceKey);
 			if (sequence && (sequence.parent !== item.parentItemKey || sequence.style !== item.style))
-				throw new Error(`Mixed numbering sequence: ${item.sequenceKey}`);
+				throw new PlaybookValidationError(`Mixed numbering sequence: ${item.sequenceKey}`);
 			sequences.set(item.sequenceKey, { parent: item.parentItemKey, style: item.style });
 			items.set(item.itemKey, { block, position });
 		}
@@ -47,7 +51,7 @@ export function validateBaseline(blocks: readonly BaselineBlock[]) {
 				block.content[0].kind !== 'text' ||
 				block.content[0].text !== '')
 		)
-			throw new Error(`Invalid optional block: ${block.blockKey}`);
+			throw new PlaybookValidationError(`Invalid optional block: ${block.blockKey}`);
 		if (block.kind === 'table') {
 			if (
 				!block.rows.length ||
@@ -57,7 +61,7 @@ export function validateBaseline(blocks: readonly BaselineBlock[]) {
 				block.headerRowCount < 0 ||
 				block.headerRowCount > block.rows.length
 			)
-				throw new Error(`Invalid table: ${block.blockKey}`);
+				throw new PlaybookValidationError(`Invalid table: ${block.blockKey}`);
 		}
 		const content =
 			block.kind === 'table' ? block.rows.flat().flatMap((c) => c.content) : block.content;
@@ -76,14 +80,14 @@ export function validateBaseline(blocks: readonly BaselineBlock[]) {
 			optional(start) ||
 			(ref.endTargetItemKey !== undefined && (!end || optional(end)))
 		)
-			throw new Error(`Unresolved reference: ${ref.targetItemKey}`);
+			throw new PlaybookValidationError(`Unresolved reference: ${ref.targetItemKey}`);
 		if (
 			end &&
 			(end.position <= start.position ||
 				end.block.numbering!.sequenceKey !== start.block.numbering!.sequenceKey ||
 				end.block.numbering!.parentItemKey !== start.block.numbering!.parentItemKey)
 		)
-			throw new Error(`Invalid reference range: ${ref.targetItemKey}`);
+			throw new PlaybookValidationError(`Invalid reference range: ${ref.targetItemKey}`);
 	}
 	for (const ref of references) validateReference(ref);
 	return { index, validateReference };

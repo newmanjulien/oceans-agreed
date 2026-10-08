@@ -1,3 +1,4 @@
+import { PlaybookValidationError } from './validation-error';
 import type { ContractChange, SourcePoint, SourceRange, Trigger } from './model';
 import type { SourceIndex, SourceContainer } from '../contract/source-index';
 import { resolvePoint } from '../contract/source-index';
@@ -10,7 +11,7 @@ import {
 	validateRange
 } from '../contract/ranges';
 
-export class GeometryError extends Error {
+export class GeometryError extends PlaybookValidationError {
 	constructor(
 		readonly kind: 'trigger-boundary' | 'ambiguous-owner' | 'invalid-slot',
 		message: string

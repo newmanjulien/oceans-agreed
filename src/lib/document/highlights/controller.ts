@@ -32,6 +32,7 @@ export function getDocumentHighlights(
 type PageRecord = {
 	geometry: PageGeometry;
 	triggers: MeasuredInterval[];
+	annotationIds: ReadonlySet<string>;
 	revisions: MeasuredInterval[];
 	groups: Map<string, Map<Range, MeasuredInterval[]>>;
 };
@@ -119,7 +120,7 @@ export class DocumentHighlightController {
 	#pages = new Map<number, PageRecord>();
 	#publication: PageHighlights = new Map();
 	#listeners = new Set<(pages: PageHighlights) => void>();
-	#hoveredOwner: HTMLElement | null = null;
+	#hoveredAnnotationId: string | null = null;
 	#geometryListeners = new Set<(change: GeometryChange) => void>();
 	#layoutEpoch: string | undefined;
 	/** Synchronous measurement always drains dirty pages from the latest committed DOM. */
@@ -397,13 +398,16 @@ export class DocumentHighlightController {
 			)?.owner ?? null
 		);
 	}
-	setHoveredOwner(owner: HTMLElement | null) {
-		if (this.#hoveredOwner === owner) return;
-		for (const target of [this.#hoveredOwner, owner]) {
-			const page = target?.closest<HTMLElement>('.document-page');
-			if (page) this.#paintDirty.add(Number(page.dataset.pageNumber));
+	setHoveredAnnotationId(annotationId: string | null) {
+		if (this.#destroyed || this.#hoveredAnnotationId === annotationId) return;
+		for (const [number, page] of this.#pages) {
+			if (
+				(this.#hoveredAnnotationId !== null && page.annotationIds.has(this.#hoveredAnnotationId)) ||
+				(annotationId !== null && page.annotationIds.has(annotationId))
+			)
+				this.#paintDirty.add(number);
 		}
-		this.#hoveredOwner = owner;
+		this.#hoveredAnnotationId = annotationId;
 		this.#schedule();
 	}
 	subscribeGeometry(listener: (change: GeometryChange) => void) {
@@ -604,7 +608,13 @@ export class DocumentHighlightController {
 					characterData: true,
 					attributes: true,
 					attributeOldValue: true,
-					attributeFilter: ['aria-pressed', 'class', 'data-revision']
+					attributeFilter: [
+						'aria-pressed',
+						'class',
+						'data-revision',
+						'data-annotation-id',
+						'data-annotation-memberships'
+					]
 				});
 		}
 	}
@@ -664,9 +674,11 @@ export class DocumentHighlightController {
 		);
 		for (const number of pending) this.#geometryDirty.delete(number);
 		for (const geometry of updated) {
+			const triggers = measureTriggers([geometry]);
 			this.#pages.set(geometry.number, {
 				geometry,
-				triggers: measureTriggers([geometry]),
+				triggers,
+				annotationIds: new Set(triggers.flatMap((interval) => interval.annotationIds ?? [])),
 				revisions: measureRevisions([geometry]),
 				groups: new Map()
 			});
@@ -738,7 +750,7 @@ export class DocumentHighlightController {
 							...page.revisions,
 							...[...page.groups.values()].flatMap((ranges) => [...ranges.values()].flat())
 						],
-						this.#hoveredOwner
+						this.#hoveredAnnotationId
 					);
 					if (!sameHighlights(publication.get(number) ?? EMPTY_HIGHLIGHTS, rects)) {
 						publication.set(number, rects);
@@ -779,7 +791,7 @@ export class DocumentHighlightController {
 		this.#selectionIntervals = [];
 		this.#selectionBounds = null;
 		this.#publication = new Map();
-		this.#hoveredOwner = null;
+		this.#hoveredAnnotationId = null;
 		controllers.delete(this.#stage);
 		this.#stage.removeAttribute('data-highlights-ready');
 	}

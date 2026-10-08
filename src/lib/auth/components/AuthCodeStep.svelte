@@ -1,0 +1,75 @@
+<script lang="ts">
+	import AuthButton from './AuthButton.svelte';
+	import AuthStepFrame from './AuthStepFrame.svelte';
+	import AuthTextInput from './AuthTextInput.svelte';
+
+	type Props = {
+		email: string;
+		code: string;
+		errorText: string | null;
+		isSubmitting: boolean;
+		isResending: boolean;
+		onSubmit: () => void;
+		onResend: () => void;
+		onChangeEmail: () => void;
+	};
+
+	let {
+		email,
+		code = $bindable(),
+		errorText,
+		isSubmitting,
+		isResending,
+		onSubmit,
+		onResend,
+		onChangeEmail
+	}: Props = $props();
+	const canSubmit = $derived(code.trim().length > 0 && !isSubmitting);
+</script>
+
+<AuthStepFrame title="Enter your code">
+	<form
+		class="grid gap-3.5"
+		onsubmit={(event) => {
+			event.preventDefault();
+			if (canSubmit) {
+				onSubmit();
+			}
+		}}
+	>
+		<p class="m-0 text-sm leading-5 text-[#686b73]">
+			Sent a code to {email}
+		</p>
+		<AuthTextInput
+			label="Verification code"
+			bind:value={code}
+			autocomplete="one-time-code"
+			inputmode="numeric"
+			required
+			autofocus
+		/>
+		{#if errorText}
+			<p class="m-0 text-sm leading-5 text-red-600">{errorText}</p>
+		{/if}
+		<AuthButton type="submit" disabled={!canSubmit}>
+			{isSubmitting ? 'Checking...' : 'Continue'}
+		</AuthButton>
+		<div class="flex items-center justify-between gap-3 text-[13px] leading-5">
+			<button
+				type="button"
+				class="cursor-pointer rounded-button-sm text-ink-muted underline underline-offset-2 transition-colors hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+				onclick={onChangeEmail}
+			>
+				Change email
+			</button>
+			<button
+				type="button"
+				class="cursor-pointer rounded-button-sm text-ink-muted underline underline-offset-2 transition-colors hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:text-stone-300"
+				disabled={isResending}
+				onclick={onResend}
+			>
+				{isResending ? 'Sending...' : 'Resend code'}
+			</button>
+		</div>
+	</form>
+</AuthStepFrame>

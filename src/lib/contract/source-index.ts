@@ -1,3 +1,4 @@
+import { PlaybookValidationError } from '../playbook/validation-error';
 import type { BaselineBlock, InlineSource, SourcePoint } from './source-model';
 import { numberSourceKey } from './source-model';
 import { iterateNumberAddresses, referenceText, type Address } from './numbering';
@@ -78,7 +79,7 @@ export function* iterateSourceIndex(
 		const local: SourceUnit[] = [];
 		function add(sourceKey: string, kind: SourceUnit['kind'], length: number, displayText: string) {
 			if (!sourceKey.trim() || sourceKey !== sourceKey.trim() || byKey.has(sourceKey))
-				throw new Error(`Invalid or duplicate source: ${sourceKey}`);
+				throw new PlaybookValidationError(`Invalid or duplicate source: ${sourceKey}`);
 			const unit = Object.freeze({
 				sourceKey,
 				kind,
@@ -104,7 +105,7 @@ export function* iterateSourceIndex(
 		for (const atom of content) {
 			yield undefined;
 			if (atom.sourceKey.startsWith('number:'))
-				throw new Error(`Reserved source namespace: ${atom.sourceKey}`);
+				throw new PlaybookValidationError(`Reserved source namespace: ${atom.sourceKey}`);
 			add(
 				atom.sourceKey,
 				atom.kind,
@@ -113,8 +114,11 @@ export function* iterateSourceIndex(
 			);
 		}
 		if (!local.length)
-			throw new Error(`Container needs a persisted empty text anchor: ${containerKey}`);
-		if (containers.has(containerKey)) throw new Error(`Duplicate container: ${containerKey}`);
+			throw new PlaybookValidationError(
+				`Container needs a persisted empty text anchor: ${containerKey}`
+			);
+		if (containers.has(containerKey))
+			throw new PlaybookValidationError(`Duplicate container: ${containerKey}`);
 		containers.set(
 			containerKey,
 			Object.freeze({
@@ -132,9 +136,9 @@ export function* iterateSourceIndex(
 			block.blockKey !== block.blockKey.trim() ||
 			blockMap.has(block.blockKey)
 		)
-			throw new Error(`Invalid or duplicate block: ${block.blockKey}`);
+			throw new PlaybookValidationError(`Invalid or duplicate block: ${block.blockKey}`);
 		if (!Number.isSafeInteger(block.order) || block.order <= previousOrder)
-			throw new Error(`Invalid block order: ${block.blockKey}`);
+			throw new PlaybookValidationError(`Invalid block order: ${block.blockKey}`);
 		previousOrder = block.order;
 		blockMap.set(block.blockKey, block);
 		if (block.kind === 'table') {
@@ -156,7 +160,7 @@ export function resolvePoint(index: SourceIndex, point: SourcePoint): SourceUnit
 		point.offset < 0 ||
 		point.offset > unit.length
 	)
-		throw new Error(`Invalid source point: ${point.sourceKey}@${point.offset}`);
+		throw new PlaybookValidationError(`Invalid source point: ${point.sourceKey}@${point.offset}`);
 	return unit;
 }
 export function pointPosition(index: SourceIndex, point: SourcePoint): number {

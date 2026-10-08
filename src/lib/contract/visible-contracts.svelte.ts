@@ -3,15 +3,19 @@ import { untrack } from 'svelte';
 import { observeHomeWarming } from '$lib/document/runtime/render-perf';
 import { getDocumentResources } from '$lib/document/runtime/resources.svelte';
 import { getContractSnapshotCache } from './snapshot-cache';
-import { rankCards, type CachedCard } from './browser-storage';
+import { rankCards } from './browser-storage';
+import type { SavedContractCard } from './card';
+import { afterStartupPaint } from '$lib/auth/startup-perf';
 
 /** One viewport observer and one preparation policy for both Home and search. */
 export function createVisibleContractWarming() {
 	const resources = getDocumentResources();
-	const cards = new Map<Element, CachedCard>();
+	const cards = new Map<Element, SavedContractCard>();
 	const visible = new Set<string>();
 	const promoted = new Set<string>();
-	let pending = false;
+	let pending = true;
+	let enabled = false;
+	let cancelStart: (() => void) | undefined;
 	let releaseObservation: (() => void) | undefined;
 	let destroyed = false;
 	let observer: IntersectionObserver | undefined;
@@ -20,8 +24,8 @@ export function createVisibleContractWarming() {
 		const ids = resources?.preparationCandidates ?? [];
 		untrack(() => {
 			if (destroyed) return;
+			cache?.backgroundCandidates(ids);
 			for (const id of ids) {
-				cache?.queue(id);
 				const data = cache?.peek(id);
 				if (data) resources?.prepare(data);
 			}
@@ -38,11 +42,10 @@ export function createVisibleContractWarming() {
 				.map(([, card]) => card),
 			[...promoted]
 		);
-		const ids = pending ? ranked.filter((id) => promoted.has(id)) : ranked;
+		const ids = !enabled || pending ? [] : ranked;
 		resources?.candidates(ids);
-		for (const id of ids) cache?.queue(id);
 	}
-	const observe: Action<HTMLElement, CachedCard> = (node, card) => {
+	const observe: Action<HTMLElement, SavedContractCard> = (node, card) => {
 		releaseObservation ??= observeHomeWarming();
 		cache ??= getContractSnapshotCache();
 		if (typeof IntersectionObserver !== 'undefined') {
@@ -52,10 +55,8 @@ export function createVisibleContractWarming() {
 					if (!card) continue;
 					if (entry.isIntersecting) {
 						visible.add(card._id);
-						cache?.queue(card._id);
 					} else {
 						visible.delete(card._id);
-						cache?.cancelQueued(card._id);
 					}
 				}
 				candidates();
@@ -65,7 +66,6 @@ export function createVisibleContractWarming() {
 		if (observer) observer.observe(node);
 		else {
 			visible.add(card._id);
-			cache.queue(card._id);
 			candidates();
 		}
 		return {
@@ -79,7 +79,6 @@ export function createVisibleContractWarming() {
 				cards.delete(node);
 				visible.delete(card._id);
 				promoted.delete(card._id);
-				cache?.cancelQueued(card._id);
 				candidates();
 			}
 		};
@@ -87,14 +86,38 @@ export function createVisibleContractWarming() {
 	return {
 		observe,
 		pending(value: boolean) {
+			if (pending === value) return;
 			pending = value;
+			cancelStart?.();
+			cancelStart = undefined;
+			enabled = false;
+			cache ??= getContractSnapshotCache();
+			cache.pauseBackground();
+			if (resources) resources.backgroundEnabled = false;
+			if (!value) {
+				cancelStart = afterStartupPaint(() => {
+					const start = () => {
+						if (destroyed || pending) return;
+						enabled = true;
+						if (resources) resources.backgroundEnabled = true;
+						candidates();
+						cache?.allowBackground();
+					};
+					if ('requestIdleCallback' in window) {
+						const idle = window.requestIdleCallback(start, { timeout: 2000 });
+						cancelStart = () => window.cancelIdleCallback(idle);
+					} else {
+						const timer = setTimeout(start, 100);
+						cancelStart = () => clearTimeout(timer);
+					}
+				});
+			}
 			candidates();
 		},
 		warm(id: string) {
 			resources?.promote(id);
 			promoted.add(id);
 			visible.add(id);
-			(cache ??= getContractSnapshotCache()).promote(id);
 			candidates();
 		},
 		cool(id: string) {
@@ -102,9 +125,12 @@ export function createVisibleContractWarming() {
 		},
 		destroy() {
 			destroyed = true;
+			cancelStart?.();
+			cache?.pauseBackground();
+			if (resources) resources.backgroundEnabled = false;
 			releaseObservation?.();
 			observer?.disconnect();
-			for (const card of cards.values()) cache?.cancelQueued(card._id);
+			cache?.backgroundCandidates([]);
 			cards.clear();
 			visible.clear();
 			promoted.clear();

@@ -3,9 +3,9 @@ import type { Snippet } from 'svelte';
 import type { ContractChange, SourcePoint, SourceRange } from '$lib/playbook/model';
 import type { ContractRouteData } from '$lib/contract/saved';
 import type { ContractSourceInput } from './source.svelte';
-import { createContractWorkspace, type ContractWorkspace } from './context';
+import type { createContractWorkspace, ContractWorkspace } from './context';
 import type { ContractLayoutProfiles } from './layout-context.svelte';
-import { recordAdminSourceUpdate, recordColdStart } from './render-perf';
+import { recordColdStart } from './render-perf';
 import { recentOpenings } from '$lib/contract/browser-storage';
 import { sameSelection } from '$lib/playbook/model';
 import { type ConcessionSelection } from './types';
@@ -15,6 +15,7 @@ export interface ViewerBindings {
 	footerContent?: Snippet;
 	selectedConcessions: ConcessionSelection;
 	hasPanel?: boolean;
+	interactive?: boolean;
 	followScroll?: boolean;
 	selectedAnnotationId?: string | null;
 	selectedRanges?: readonly SourceRange[];
@@ -35,6 +36,7 @@ export class DocumentResource {
 	bindings = $state.raw<ViewerBindings>();
 	target = $state<HTMLElement>();
 	active = $state(false);
+	draftOwned = $state(false);
 	opening = $state(false);
 	openings = 0;
 	allowed = $state(false);
@@ -43,12 +45,17 @@ export class DocumentResource {
 	lastUsed = 0;
 	completed = false;
 	readonly priority = () =>
-		this.active || this.opening ? ('foreground' as const) : ('background' as const);
+		this.active || this.opening || this.draftOwned
+			? ('foreground' as const)
+			: ('background' as const);
+	id = $state('');
 	constructor(
-		readonly id: string,
-		input: ContractSourceInput
+		id: string,
+		input: ContractSourceInput,
+		createWorkspace: typeof createContractWorkspace
 	) {
-		this.workspace = createContractWorkspace(input);
+		this.id = id;
+		this.workspace = createWorkspace(input);
 	}
 	destroy() {
 		this.allowed = false;
@@ -67,10 +74,11 @@ export class DocumentResources {
 	entries = $state.raw<readonly DocumentResource[]>([]);
 	active = $state.raw<DocumentResource>();
 	warming = $state(true);
+	backgroundEnabled = $state(false);
+	createWorkspace = $state.raw<typeof createContractWorkspace>();
 	#candidates = $state.raw<readonly string[]>([]);
 	#pending = $state.raw<readonly ReadyContract[]>([]);
 	#canConstruct = $state(false);
-	#savedBusy = $state(false);
 	#rank: readonly string[] = [];
 	#failed = new Set<string>();
 	#clock = 0;
@@ -79,45 +87,17 @@ export class DocumentResources {
 	get preparationCandidates() {
 		return this.#candidates;
 	}
-	constructor(
-		readonly profiles: ContractLayoutProfiles,
-		admin: ContractSourceInput
-	) {
+	constructor(readonly profiles: ContractLayoutProfiles) {
 		this.#release = $effect.root(() => {
 			$effect(() => {
-				const input = {
-					blocks: { data: admin.blocks.data, error: admin.blocks.error },
-					items: { data: admin.items.data, error: admin.items.error }
-				};
 				const profiler = profiles.profiler;
-				const active = this.active?.id === 'admin';
-				const savedBusy = this.#savedBusy;
-				const complete = Boolean(
-					input.blocks.data && input.items.data && !input.blocks.error && !input.items.error
-				);
-				const entry = untrack(() => this.entries.find((entry) => entry.id === 'admin'));
-				untrack(() => recordAdminSourceUpdate());
-				if (!complete && !entry) return;
-				const accept = () =>
-					untrack(() => {
-						if (complete) this.acquire('admin', input);
-						else entry?.workspace.accept(input);
-					});
-				if (active) {
-					accept();
-					return;
-				}
-				if (!profiler || savedBusy) return;
-				const abort = new AbortController();
-				void profiler.scheduler.run(() => 'background', accept, abort.signal).catch(() => {});
-				return () => abort.abort();
-			});
-			$effect(() => {
-				const profiler = profiles.profiler;
+				const backgroundEnabled = this.backgroundEnabled;
+				const createWorkspace = this.createWorkspace;
 				const states = this.entries.map((entry) => ({
 					entry,
 					active: entry.active,
 					opening: entry.opening,
+					draftOwned: entry.draftOwned,
 					pages: entry.workspace.renderer.retainedPageCount,
 					failed: Boolean(
 						entry.workspace.renderer.error ||
@@ -142,12 +122,15 @@ export class DocumentResources {
 				untrack(() => {
 					for (const state of states) if (state.prepared) state.entry.completed = true;
 					for (const state of states)
-						if (state.failed && !state.active && !state.opening) {
+						if (state.failed && !state.active && !state.opening && !state.draftOwned) {
 							this.failedPreparation(state.entry.id);
 						}
 					if (candidates !== this.#candidates) return;
 					const foregroundBusy = states.some(
-						(state) => (state.active || state.opening) && !state.prepared && !state.failed
+						(state) =>
+							(state.active || state.opening || state.draftOwned) &&
+							!state.prepared &&
+							!state.failed
 					);
 					const nextId = candidates.find(
 						(id) =>
@@ -166,22 +149,14 @@ export class DocumentResources {
 						state.entry.allowed =
 							state.active ||
 							state.opening ||
-							state.prepared ||
-							(state.entry.id === 'admin'
-								? !savedBusy
-								: !foregroundBusy && state.entry.id === nextId);
+							state.draftOwned ||
+							(backgroundEnabled &&
+								state.entry.id !== 'admin' &&
+								(state.prepared || (!foregroundBusy && state.entry.id === nextId)));
 					}
-					this.#savedBusy = savedBusy;
-					this.#canConstruct = !foregroundBusy && constructing;
-					this.warming =
-						savedBusy ||
-						states.some(
-							(state) =>
-								state.entry.id === 'admin' &&
-								state.entry.allowed &&
-								!state.prepared &&
-								!state.failed
-						);
+					this.#canConstruct =
+						Boolean(createWorkspace) && backgroundEnabled && !foregroundBusy && constructing;
+					this.warming = savedBusy;
 					this.#trim();
 				});
 			});
@@ -223,11 +198,39 @@ export class DocumentResources {
 		let entry = this.entries.find((entry) => entry.id === id);
 		if (!entry) {
 			if (id !== 'admin') this.#makeRoom(id);
-			entry = new DocumentResource(id, input);
+			if (!this.createWorkspace) throw new Error('Document rendering is not loaded.');
+			entry = new DocumentResource(id, input, this.createWorkspace);
 			this.entries = [...this.entries, entry];
 		} else entry.workspace.accept(input);
 		entry.lastUsed = ++this.#clock;
 		return entry;
+	}
+	createDraft(input: ContractSourceInput) {
+		const entry = this.acquire(`draft:${++this.#clock}`, input);
+		entry.draftOwned = true;
+		entry.allowed = true;
+		return entry;
+	}
+	/** Associate a confirmed contract with the same workspace, viewer and page elements. */
+	adopt(entry: DocumentResource, data: ReadyContract) {
+		if (!this.entries.includes(entry) || !entry.draftOwned)
+			throw new Error('Draft is unavailable.');
+		const existing = this.entries.find((current) => current !== entry && current.id === data.id);
+		if (existing) this.evict(existing.id);
+		entry.workspace.accept({
+			blocks: { data: data.snapshot.blocks },
+			items: { data: data.snapshot.items }
+		});
+		entry.id = data.id!;
+		entry.confirmedChoices = data.contract.selectedConcessions;
+		this.update(entry, entry.confirmedChoices);
+		// The mounted viewer owns the render mode and its first-page paint handshake.
+		if (entry.workspace.renderer.error) entry.workspace.viewer.retry?.();
+	}
+	releaseDraft(entry: DocumentResource) {
+		entry.draftOwned = false;
+		if (entry.id.startsWith('draft:')) this.evict(entry.id);
+		else this.#trim();
 	}
 	acquireContract(data: ReadyContract) {
 		const entry = this.acquire(data.id!, {
@@ -286,6 +289,7 @@ export class DocumentResources {
 	}
 	deactivate(entry: DocumentResource) {
 		entry.active = false;
+		if (entry.id === 'admin') entry.allowed = false;
 		entry.bindings = undefined;
 		entry.target = undefined;
 		entry.workspace.viewer.ready = false;
@@ -301,7 +305,9 @@ export class DocumentResources {
 		)?.id;
 		const reserved = this.entries
 			.filter(
-				(entry) => entry.id !== 'admin' && (entry.active || entry.opening || entry.id === recent)
+				(entry) =>
+					entry.id !== 'admin' &&
+					(entry.active || entry.opening || entry.draftOwned || entry.id === recent)
 			)
 			.map((entry) => entry.id);
 		const selected = [
@@ -321,6 +327,7 @@ export class DocumentResources {
 				entry.id !== 'admin' &&
 				!entry.active &&
 				!entry.opening &&
+				!entry.draftOwned &&
 				!ids.includes(entry.id) &&
 				!entry.completed
 			)
@@ -354,7 +361,7 @@ export class DocumentResources {
 	failedPreparation(id: string) {
 		this.#failed.add(id);
 		const entry = this.entries.find((entry) => entry.id === id);
-		if (entry && !entry.active && !entry.opening) this.evict(id);
+		if (entry && !entry.active && !entry.opening && !entry.draftOwned) this.evict(id);
 		this.candidates(this.#rank);
 	}
 	remove(id: string) {
@@ -379,7 +386,7 @@ export class DocumentResources {
 			return entry.id === recent ? -1 : index < 0 ? Number.MAX_SAFE_INTEGER : index;
 		};
 		return saved
-			.filter((entry) => !entry.active && !entry.opening)
+			.filter((entry) => !entry.active && !entry.opening && !entry.draftOwned)
 			.sort((a, b) => rank(b) - rank(a) || a.lastUsed - b.lastUsed);
 	}
 	#makeRoom(id: string) {

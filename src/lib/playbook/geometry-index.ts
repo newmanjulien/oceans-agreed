@@ -1,3 +1,4 @@
+import { PlaybookValidationError } from './validation-error';
 import type { CompiledContract } from '../contract/compiled-contract';
 import { pointPosition } from '../contract/source-index';
 import { containsPoint, localContainer } from '../contract/ranges';
@@ -57,7 +58,7 @@ export class PlaybookGeometryIndex {
 	private containersFor(range: SourceRange): string[] {
 		const start = pointPosition(this.contract.index, range.start);
 		const end = pointPosition(this.contract.index, range.end);
-		if (start > end) throw new Error('Source range is reversed');
+		if (start > end) throw new PlaybookValidationError('Source range is reversed');
 		let low = 0,
 			high = this.containers.length;
 		while (low < high) {
@@ -198,9 +199,10 @@ export class PlaybookGeometryIndex {
 		validateTriggers(this.contract.index, triggers);
 		for (const trigger of triggers) {
 			if ([...(this.triggerIds.get(trigger.id) ?? [])].some((entry) => entry.itemId !== exclude))
-				throw new Error(`Duplicate Trigger ID: ${trigger.id}`);
+				throw new PlaybookValidationError(`Duplicate Trigger ID: ${trigger.id}`);
 			const other = this.triggersIntersecting(trigger.range, exclude)[0];
-			if (other) throw new Error(`Overlapping Triggers: ${other.id}, ${trigger.id}`);
+			if (other)
+				throw new PlaybookValidationError(`Overlapping Triggers: ${other.id}, ${trigger.id}`);
 		}
 		this.validateOwnershipAfterTriggers(triggers, exclude);
 	}
@@ -253,13 +255,16 @@ export class PlaybookGeometryIndex {
 					(entry) => entry.itemId !== id && entry.itemId !== exclude
 				)
 			)
-				throw new Error(`Duplicate Trigger ID: ${trigger.id}`);
+				throw new PlaybookValidationError(`Duplicate Trigger ID: ${trigger.id}`);
 			const other = this.candidates(this.triggers, trigger.range, exclude).find(
 				(entry) =>
 					entry.itemId !== id &&
 					triggersIntersect(this.contract.index, entry.trigger.range, trigger.range)
 			);
-			if (other) throw new Error(`Overlapping Triggers: ${other.trigger.id}, ${trigger.id}`);
+			if (other)
+				throw new PlaybookValidationError(
+					`Overlapping Triggers: ${other.trigger.id}, ${trigger.id}`
+				);
 		}
 		for (const concession of item.concessions) this.validateChanges(concession.changes, exclude);
 	}

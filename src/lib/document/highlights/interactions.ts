@@ -73,8 +73,9 @@ export class DocumentClauseInteractions {
 	}
 
 	#setHover(owner: HTMLElement | null) {
-		this.#highlights.setHoveredOwner(owner);
-		this.#stage.toggleAttribute('data-clause-hover', !!owner);
+		const annotationId = owner?.dataset.annotationId ?? null;
+		this.#highlights.setHoveredAnnotationId(annotationId);
+		this.#stage.toggleAttribute('data-clause-hover', annotationId !== null);
 	}
 
 	#updateHover = () => {

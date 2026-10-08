@@ -96,4 +96,26 @@ describe('snapshot caching work', () => {
 		expect(request).toHaveBeenCalledTimes(1);
 		expect(storage.immutableWrites).toBe(1);
 	});
+	it('seeds confirmed content without a download, keeps newer revisions and rejects deleted seeds', async () => {
+		const cache = getContractSnapshotCache();
+		const data = fixture();
+		const commit = storage.committedRevision(0);
+		expect(cache.seedConfirmed(data)).toBe(data);
+		await commit;
+		const request = vi.fn<typeof fetch>();
+		expect(await cache.load(id, request)).toBe(data);
+		expect(request).not.toHaveBeenCalled();
+		cache.updateState(id, {
+			companyName: 'Latest',
+			selectedConcessions: {},
+			revision: 2,
+			lastOperationId: 'latest'
+		});
+		expect(cache.seedConfirmed(data)?.contract.revision).toBe(2);
+		expect(cache.peek(id)?.snapshot).toBe(data.snapshot);
+		expect(storage.immutableWrites).toBe(1);
+		cache.remove(id);
+		expect(cache.seedConfirmed(data)).toBeUndefined();
+		expect(await cache.load(id, request)).toEqual({ id, status: 'missing' });
+	});
 });

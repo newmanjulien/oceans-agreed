@@ -1,3 +1,4 @@
+import { PlaybookValidationError } from '../playbook/validation-error';
 import type { ContractBlock, InlineAtom } from './model';
 
 export type Address = { address: string; label: string };
@@ -6,7 +7,7 @@ function numberLabel(
 	style: NonNullable<ContractBlock['numbering']>['style'],
 	position: number
 ): string {
-	if (position < 1) throw new Error('Numbering positions start at one.');
+	if (position < 1) throw new PlaybookValidationError('Numbering positions start at one.');
 	if (style === 'decimal') return `${position}.`;
 	if (style === 'lower-roman') {
 		let remaining = position;
@@ -72,7 +73,8 @@ export function* iterateNumberAddresses(
 		yield undefined;
 		if (!item) continue;
 		const parent = item.parentItemKey ? result.get(item.parentItemKey)?.address : '';
-		if (item.parentItemKey && !parent) throw new Error(`Missing parent address: ${item.itemKey}`);
+		if (item.parentItemKey && !parent)
+			throw new PlaybookValidationError(`Missing parent address: ${item.itemKey}`);
 		const position = (positions.get(item.sequenceKey) ?? 0) + 1;
 		const label = numberLabel(item.style, position);
 		positions.set(item.sequenceKey, position);
@@ -88,6 +90,6 @@ export function referenceText(
 	const start = addresses.get(atom.targetItemKey)?.address;
 	const end = atom.endTargetItemKey ? addresses.get(atom.endTargetItemKey)?.address : undefined;
 	if (!start || (atom.endTargetItemKey && !end))
-		throw new Error(`Unresolved reference: ${atom.targetItemKey}`);
+		throw new PlaybookValidationError(`Unresolved reference: ${atom.targetItemKey}`);
 	return referenceAddress(start, end);
 }

@@ -1,5 +1,7 @@
 @import 'tailwindcss';
 @import '@fontsource-variable/inter';
+@import '@fontsource/newsreader/400.css';
+@import '@fontsource/newsreader/500.css';
 
 @theme {
 	--font-sans: 'Inter Variable', Inter, sans-serif;
@@ -43,4 +45,18 @@
 
 html {
 	scrollbar-gutter: stable;
+}
+
+:root {
+	--info-200: #bfd4de;
+	--info-400: #7898a6;
+	--info-500: #5d7f90;
+	--info-600: #4d6d7c;
+	--link-200: #a7d9ff;
+	--link-400: #0087e8;
+	--link-500: #0087e8;
+	--link-600: #006ec0;
+}
+.font-quote {
+	font-family: Newsreader, 'Times New Roman', serif;
 }

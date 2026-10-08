@@ -35,17 +35,17 @@
 <section
 	bind:this={panelElement}
 	id="document-search"
-	class="pointer-events-auto w-full rounded-base border border-line bg-surface p-2.5 text-ink shadow-none"
+	class="pointer-events-auto w-full rounded-xl border border-[#e5e5e5] bg-surface p-2.5 text-ink shadow-none"
 	aria-label="Search"
 	data-utility-panel="document-search"
 >
 	<label
-		class="flex items-center gap-2.5 rounded-base border border-line bg-surface px-3 py-2.5 text-ink-secondary transition-colors hover:border-line-strong focus-within:border-accent focus-within:outline-2 focus-within:outline-offset-1 focus-within:outline-accent/18 motion-reduce:transition-none"
+		class="flex h-9 min-w-0 items-center gap-2 rounded-button-lg border border-[#e5e5e5] bg-white px-3 text-[#8a8a8a] transition-colors focus-within:border-[#d5d5d5] motion-reduce:transition-none"
 	>
 		<span class="sr-only">Find in document</span>
-		<MagnifyingGlassIcon aria-hidden="true" size={20} weight="regular" />
+		<MagnifyingGlassIcon aria-hidden="true" size={17} weight="regular" />
 		<input
-			class="min-w-0 flex-1 border-0 bg-transparent p-0 text-[15px] leading-[1.45] text-ink outline-none placeholder:text-ink-muted [&::-webkit-search-cancel-button]:hidden"
+			class="min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-ink outline-none placeholder:text-[#8a8a8a] [&::-webkit-search-cancel-button]:hidden"
 			bind:this={inputElement}
 			type="search"
 			value={session.query}

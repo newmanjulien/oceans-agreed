@@ -194,13 +194,49 @@ export async function reconcile(server, blocks, items) {
 		);
 		validateConcessionUpdate(item, semanticPlaybookDraft(item));
 		// Exercise the actual existing-record mutation with an in-memory persistence
-		// adapter. This verifies replacement payloads, not a deployed Convex transaction.
+		// adapter, including complete publication. Convex transaction guarantees are
+		// verified separately; this adapter checks preserved business payloads.
 		let persisted = structuredClone(saved);
+		const tables = new Map([
+			['contractBlocks', blocks],
+			[
+				'playbookItems',
+				items.map((value, index) => ({ ...value, _id: `seed-item-${index}`, _creationTime: 0 }))
+			]
+		]);
+		let nextId = 0;
 		const ctx = {
+			meta: {
+				getTransactionMetrics: async () => ({
+					documentsWritten: { remaining: 16_384 },
+					bytesWritten: { remaining: 16_000_000 },
+					databaseQueries: { remaining: 16_384 }
+				})
+			},
 			db: {
-				get: async () => persisted,
+				get: async (_table, id) =>
+					id === saved._id ? persisted : tables.get(_table)?.find((row) => row._id === id),
+				query: (table) => {
+					const query = {
+						withIndex: () => query,
+						take: async (count) => (tables.get(table) ?? []).slice(0, count),
+						unique: async () => tables.get(table)?.[0] ?? null
+					};
+					return query;
+				},
+				insert: async (table, value) => {
+					const row = { ...value, _id: `publication-${++nextId}` };
+					tables.set(table, [...(tables.get(table) ?? []), row]);
+					return row._id;
+				},
+				patch: async (table, id, value) =>
+					Object.assign(
+						tables.get(table).find((row) => row._id === id),
+						value
+					),
 				replace: async (_table, _id, value) => {
 					persisted = { ...value, _id: saved._id, _creationTime: 0 };
+					tables.get('playbookItems')[i] = persisted;
 				}
 			}
 		};

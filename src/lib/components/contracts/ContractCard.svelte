@@ -3,7 +3,7 @@
 	import SquareIconButton from '$lib/components/ui/SquareIconButton.svelte';
 	import Avatar from '$lib/components/ui/Avatar.svelte';
 	import DotsThreeVerticalIcon from 'phosphor-svelte/lib/DotsThreeVerticalIcon';
-	import type { CachedCard } from '$lib/contract/browser-storage';
+	import type { SavedContractCard } from '$lib/contract/card';
 	import type { Action } from 'svelte/action';
 	let {
 		contract,
@@ -14,11 +14,11 @@
 		onWarm,
 		onCool
 	}: {
-		contract: CachedCard;
+		contract: SavedContractCard;
 		deleting?: boolean;
 		onRename: () => void;
 		onDelete: () => void;
-		observe: Action<HTMLElement, CachedCard>;
+		observe: Action<HTMLElement, SavedContractCard>;
 		onWarm: () => void;
 		onCool: () => void;
 	} = $props();

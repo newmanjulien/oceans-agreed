@@ -2,10 +2,21 @@ import { baselineBlock } from '../../convex/sourceValidators';
 import { playbookItem } from '../../convex/playbookValidators';
 import type { ContractRouteData } from './saved';
 import { CACHE_NAMESPACE } from './browser-storage';
+import { ReadAttempt, waitForRead } from '$lib/auth/attempt';
 
 export type ReadyContract = Extract<ContractRouteData, { status: 'ready' }>;
 export const SNAPSHOT_ENTRIES = 24;
 export const SNAPSHOT_BYTES = 32 * 1024 * 1024;
+export type SnapshotSize = { bytes: number; immutableBytes: number };
+export type SnapshotEntry = SnapshotSize & { data: ReadyContract };
+type Write = (
+	| { kind: 'put'; entry: SnapshotEntry }
+	| { kind: 'update'; contract: ReadyContract['contract']; bytes: number }
+	| { kind: 'delete' }
+	| { kind: 'touch' }
+) & { valid: () => boolean };
+const writeBytes = (write: Write) =>
+	write.kind === 'put' ? write.entry.bytes : write.kind === 'update' ? write.bytes : 0;
 type StoredSnapshot = { id: string; snapshot: ReadyContract['snapshot'] };
 type StoredMetadata = {
 	id: string;
@@ -62,6 +73,7 @@ export function validSnapshot(value: unknown, id: string): value is ReadyContrac
 		Number.isFinite(contract.savedAt) &&
 		Number.isFinite(contract.blockCount) &&
 		Number.isFinite(contract.itemCount) &&
+		(contract.templateVersionId === undefined || typeof contract.templateVersionId === 'string') &&
 		(contract.lastOperationId === undefined || typeof contract.lastOperationId === 'string') &&
 		(contract.revision === undefined || Number.isFinite(contract.revision)) &&
 		!!contract.selectedConcessions &&
@@ -99,13 +111,35 @@ function completed(transaction: IDBTransaction) {
 }
 /** Independent disk LRU. Immutable content and frequently updated metadata have separate stores. */
 export class SnapshotStorage {
+	private namespace = CACHE_NAMESPACE;
+	private closed = false;
 	private database: Promise<IDBDatabase | undefined> | undefined;
-	private writes: Promise<unknown> = Promise.resolve();
+	private lifetime = new AbortController();
+	private pending = new Map<string, Write>();
+	private pendingBytes = 0;
+	private activeBytes = 0;
+	private writing = false;
 	private open() {
+		if (this.closed) return Promise.resolve(undefined);
 		return (this.database ??= new Promise((resolve) => {
+			const opening = new ReadAttempt(250);
+			let settled = false;
+			const finish = (db?: IDBDatabase) => {
+				if (settled) {
+					db?.close();
+					return;
+				}
+				settled = true;
+				opening.complete();
+				opening.signal.removeEventListener('abort', failed);
+				this.lifetime.signal.removeEventListener('abort', failed);
+				resolve(db);
+			};
+			const failed = () => finish();
+			opening.signal.addEventListener('abort', failed, { once: true });
+			this.lifetime.signal.addEventListener('abort', failed, { once: true });
 			try {
-				const request = indexedDB.open(`${CACHE_NAMESPACE}:snapshots`, 2);
-				let settled = false;
+				const request = indexedDB.open(`${this.namespace}:snapshots`, 2);
 				request.onupgradeneeded = () => {
 					// The old combined format is an optional cache; rebuild it on demand.
 					if (request.result.objectStoreNames.contains('snapshots'))
@@ -113,34 +147,68 @@ export class SnapshotStorage {
 					request.result.createObjectStore('snapshots', { keyPath: 'id' });
 					request.result.createObjectStore('metadata', { keyPath: 'id' });
 				};
-				request.onblocked = request.onerror = () => {
-					settled = true;
-					resolve(undefined);
-				};
+				request.onblocked = request.onerror = failed;
 				request.onsuccess = () => {
-					if (settled) {
-						request.result.close();
-						return;
-					}
-					request.result.onversionchange = () => request.result.close();
-					resolve(request.result);
+					request.result.onversionchange = () => this.close();
+					finish(request.result);
 				};
 			} catch {
-				resolve(undefined);
+				failed();
 			}
 		}));
 	}
-	async get(id: string): Promise<ReadyContract | undefined> {
+	private async transaction<T>(
+		db: IDBDatabase,
+		mode: IDBTransactionMode,
+		work: (tx: IDBTransaction) => Promise<T>,
+		cancel?: AbortSignal
+	): Promise<T> {
+		const attempt = new ReadAttempt(1000);
+		const signal = AbortSignal.any([
+			this.lifetime.signal,
+			attempt.signal,
+			...(cancel ? [cancel] : [])
+		]);
+		let tx: IDBTransaction | undefined;
+		const abort = () => {
+			try {
+				tx?.abort();
+			} catch {
+				/* Already settled. */
+			}
+		};
 		try {
-			const db = await this.open();
-			if (!db) return;
-			const tx = db.transaction(['snapshots', 'metadata'], 'readonly');
+			signal.throwIfAborted();
+			tx = db.transaction(['snapshots', 'metadata'], mode);
+			signal.addEventListener('abort', abort, { once: true });
 			const done = completed(tx);
 			done.catch(() => {});
-			const [entry, metadata] = await Promise.all([
-				result<StoredSnapshot | undefined>(tx.objectStore('snapshots').get(id)),
-				result<StoredMetadata | undefined>(tx.objectStore('metadata').get(id))
-			]);
+			const value = await waitForRead(work(tx), signal);
+			await waitForRead(done, signal);
+			return value;
+		} catch (error) {
+			abort();
+			throw error;
+		} finally {
+			attempt.complete();
+			signal.removeEventListener('abort', abort);
+		}
+	}
+	async get(id: string, signal?: AbortSignal): Promise<SnapshotEntry | undefined> {
+		try {
+			const db = await this.open();
+			if (!db || signal?.aborted) return;
+			const [entry, metadata] = await this.transaction(
+				db,
+				'readonly',
+				(tx) =>
+					Promise.all([
+						result<StoredSnapshot | undefined>(tx.objectStore('snapshots').get(id)),
+						result<StoredMetadata | undefined>(tx.objectStore('metadata').get(id))
+					]),
+				signal
+			);
+			if (signal?.aborted) return;
 			const data =
 				entry && metadata
 					? { id, status: 'ready' as const, snapshot: entry.snapshot, contract: metadata.contract }
@@ -156,32 +224,108 @@ export class SnapshotStorage {
 				metadata.immutableBytes <= metadata.bytes &&
 				Number.isFinite(metadata.usedAt) &&
 				validSnapshot(data, id);
-			await done;
 			if (!valid) {
-				if (entry || metadata) this.delete(id);
+				if (entry || metadata) this.delete(id, () => !signal?.aborted);
 				return;
 			}
-			this.touch(id);
-			return data;
+			this.enqueue(id, { kind: 'touch', valid: () => !signal?.aborted });
+			return { data, bytes: metadata.bytes, immutableBytes: metadata.immutableBytes };
 		} catch {
 			return;
 		}
 	}
-	private enqueue(write: () => Promise<void>) {
-		this.writes = this.writes.then(write).catch(() => {});
+	close() {
+		this.closed = true;
+		this.pending.clear();
+		this.pendingBytes = 0;
+		this.lifetime.abort();
+		void this.database?.then((db) => db?.close());
 	}
-	private touch(id: string) {
-		this.enqueue(async () => {
+	private enqueue(id: string, write: Write) {
+		if (this.closed || !write.valid()) return;
+		const previous = this.pending.get(id);
+		if (write.kind === 'touch' && previous) return;
+		if (write.kind === 'update' && previous?.kind === 'delete') return;
+		if (write.kind === 'update' && previous?.kind === 'put') {
+			write = {
+				kind: 'put',
+				valid: write.valid,
+				entry: {
+					data: { ...previous.entry.data, contract: write.contract },
+					immutableBytes: previous.entry.immutableBytes,
+					bytes: previous.entry.immutableBytes + write.bytes
+				}
+			};
+		}
+		if (previous) this.pendingBytes -= writeBytes(previous);
+		this.pending.delete(id);
+		this.pending.set(id, write);
+		this.pendingBytes += writeBytes(write);
+		// Include the active payload: stalled storage must not retain an unbounded write backlog.
+		while (
+			this.pending.size > SNAPSHOT_ENTRIES ||
+			this.pendingBytes + this.activeBytes > SNAPSHOT_BYTES
+		) {
+			const oldest = this.pending.keys().next().value!;
+			this.pendingBytes -= writeBytes(this.pending.get(oldest)!);
+			this.pending.delete(oldest);
+		}
+		if (!this.writing) void this.drain();
+	}
+	private async drain() {
+		this.writing = true;
+		try {
+			// Open before taking a payload out of the bounded queue.
 			const db = await this.open();
-			if (!db) return;
-			const tx = db.transaction('metadata', 'readwrite');
-			const done = completed(tx);
-			done.catch(() => {});
-			const store = tx.objectStore('metadata');
+			if (!db) {
+				this.pending.clear();
+				this.pendingBytes = 0;
+				return;
+			}
+			while (!this.closed && this.pending.size) {
+				const [id, write] = this.pending.entries().next().value!;
+				this.pending.delete(id);
+				this.activeBytes = writeBytes(write);
+				this.pendingBytes -= this.activeBytes;
+				try {
+					if (write.valid())
+						await this.transaction(db, 'readwrite', (tx) => this.write(tx, id, write));
+				} catch {
+					/* Optional cache; failed writes do not affect confirmed server state. */
+				} finally {
+					this.activeBytes = 0;
+				}
+			}
+		} finally {
+			this.writing = false;
+		}
+	}
+	private async write(tx: IDBTransaction, id: string, write: Write) {
+		const store = tx.objectStore('metadata');
+		if (write.kind === 'delete') {
+			store.delete(id);
+			tx.objectStore('snapshots').delete(id);
+			return;
+		}
+		if (write.kind === 'put') {
+			const { data, bytes, immutableBytes } = write.entry;
+			tx.objectStore('snapshots').put({ id, snapshot: data.snapshot });
+			store.put({ id, contract: data.contract, bytes, immutableBytes, usedAt: Date.now() });
+		} else {
 			const metadata = await result<StoredMetadata | undefined>(store.get(id));
-			if (metadata) store.put({ ...metadata, usedAt: Date.now() });
-			await done;
-		});
+			if (!metadata || !write.valid()) return;
+			store.put(
+				write.kind === 'touch'
+					? { ...metadata, usedAt: Date.now() }
+					: {
+							...metadata,
+							contract: write.contract,
+							bytes: metadata.immutableBytes + write.bytes,
+							usedAt: Date.now()
+						}
+			);
+		}
+		if (write.kind !== 'touch') await this.enforceLimits(tx);
 	}
 	private async enforceLimits(tx: IDBTransaction) {
 		const store = tx.objectStore('metadata');
@@ -196,55 +340,19 @@ export class SnapshotStorage {
 			count--;
 		}
 	}
-	put(data: ReadyContract, valid: () => boolean) {
-		this.enqueue(async () => {
-			const db = await this.open();
-			if (!db || !valid()) return;
-			const immutableBytes = JSON.stringify(data.snapshot).length * 2;
-			const bytes = immutableBytes + JSON.stringify(data.contract).length * 2;
-			if (bytes > SNAPSHOT_BYTES) return;
-			const tx = db.transaction(['snapshots', 'metadata'], 'readwrite');
-			const done = completed(tx);
-			done.catch(() => {});
-			tx.objectStore('snapshots').put({ id: data.id, snapshot: data.snapshot });
-			tx.objectStore('metadata').put({
-				id: data.id,
-				contract: data.contract,
-				bytes,
-				immutableBytes,
-				usedAt: Date.now()
-			});
-			await this.enforceLimits(tx);
-			await done;
-		});
+	put(entry: SnapshotEntry, valid: () => boolean) {
+		const { data, bytes, immutableBytes } = entry;
+		this.enqueue(data.id!, { kind: 'put', entry: { data, bytes, immutableBytes }, valid });
 	}
-	updateContract(id: string, contract: ReadyContract['contract'], valid: () => boolean) {
-		this.enqueue(async () => {
-			const db = await this.open();
-			if (!db || !valid()) return;
-			const tx = db.transaction(['snapshots', 'metadata'], 'readwrite');
-			const done = completed(tx);
-			done.catch(() => {});
-			const store = tx.objectStore('metadata');
-			const metadata = await result<StoredMetadata | undefined>(store.get(id));
-			if (metadata && valid()) {
-				const bytes = metadata.immutableBytes + JSON.stringify(contract).length * 2;
-				store.put({ ...metadata, contract, bytes, usedAt: Date.now() });
-				await this.enforceLimits(tx);
-			}
-			await done;
-		});
+	updateContract(
+		id: string,
+		contract: ReadyContract['contract'],
+		bytes: number,
+		valid: () => boolean
+	) {
+		this.enqueue(id, { kind: 'update', contract, bytes, valid });
 	}
-	delete(id: string) {
-		this.enqueue(async () => {
-			const db = await this.open();
-			if (!db) return;
-			const tx = db.transaction(['snapshots', 'metadata'], 'readwrite');
-			const done = completed(tx);
-			done.catch(() => {});
-			tx.objectStore('snapshots').delete(id);
-			tx.objectStore('metadata').delete(id);
-			await done;
-		});
+	delete(id: string, valid: () => boolean = () => true) {
+		this.enqueue(id, { kind: 'delete', valid });
 	}
 }

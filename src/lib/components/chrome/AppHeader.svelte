@@ -3,7 +3,14 @@
 	import { page } from '$app/state';
 	import type { Snippet } from 'svelte';
 	import Avatar from '$lib/components/ui/Avatar.svelte';
-	import { OCEANS_PROFILE } from '$lib/profiles';
+	import { useViewer, useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import Menu from '$lib/components/ui/Menu.svelte';
+	import { goto } from '$app/navigation';
+	const viewer = useViewer();
+	const session = useViewerSession();
+	let menuOpen = $state(false);
+	let trigger = $state<HTMLButtonElement>();
+
 	let { actions, children }: { actions?: Snippet; children?: Snippet } = $props();
 	const navItems = [
 		{ label: 'Home', href: '/' },
@@ -25,7 +32,7 @@
 				{@const active =
 					item.href === '/admin'
 						? page.url.pathname.startsWith('/admin')
-						: !page.url.pathname.startsWith('/admin')}
+						: page.url.pathname === '/' || page.url.pathname.startsWith('/contracts')}
 				<a
 					class="relative mr-0.5 flex items-center px-1.5 text-[13px] leading-none transition-colors sm:mr-3"
 					class:text-ink={active}
@@ -41,7 +48,48 @@
 		</nav>
 		<div class="my-auto ml-auto flex min-w-0 items-center gap-1.5 sm:gap-3">
 			{#if actions}{@render actions()}{/if}
-			<Avatar name={OCEANS_PROFILE.name} avatarUrl={OCEANS_PROFILE.avatarUrl} size={26} />
+			<button
+				bind:this={trigger}
+				class="inline-flex size-6.5 cursor-pointer items-center justify-center rounded-full transition-shadow duration-150 hover:ring-3 hover:ring-[#f5f5f5] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+				aria-label="Your account"
+				aria-haspopup="menu"
+				aria-expanded={menuOpen}
+				aria-controls="account-menu"
+				onclick={() => (menuOpen = !menuOpen)}
+				><Avatar
+					name={viewer().profile.name || viewer().profile.email}
+					avatarUrl={viewer().profile.avatarUrl}
+					size={26}
+				/></button
+			>
+			<Menu
+				open={menuOpen}
+				{trigger}
+				onClose={() => (menuOpen = false)}
+				id="account-menu"
+				label="Your account"
+			>
+				{#snippet children(close)}
+					{#each [{ label: 'Settings', href: '/settings' }, { label: 'Invite colleagues', href: '/team' }] as item}
+						<button
+							role="menuitem"
+							class="block w-full cursor-pointer rounded-button-lg px-3 py-2 text-left text-[13px] text-ink-secondary hover:bg-[#f3f3f3] focus-visible:bg-[#f3f3f3] focus-visible:outline-2 focus-visible:outline-accent"
+							onclick={() => {
+								close();
+								void goto(item.href);
+							}}>{item.label}</button
+						>
+					{/each}
+					<button
+						role="menuitem"
+						class="block w-full cursor-pointer rounded-button-lg px-3 py-2 text-left text-[13px] text-ink-secondary hover:bg-[#f3f3f3] focus-visible:bg-[#f3f3f3] focus-visible:outline-2 focus-visible:outline-accent"
+						onclick={() => {
+							close();
+							void session.signOut();
+						}}>Log out</button
+					>
+				{/snippet}
+			</Menu>
 		</div>
 	</div>
 	{#if children}{@render children()}{/if}

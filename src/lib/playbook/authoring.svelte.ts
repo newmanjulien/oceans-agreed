@@ -60,6 +60,8 @@ export class AuthoringSession {
 	private geometryIndex = $state.raw<PlaybookGeometryIndex | null>(null);
 	private geometryVersion = $state(0);
 	private validateGeometry: ReturnType<PlaybookGeometryIndex['createDraftValidator']> | null = null;
+	private running: Promise<boolean> | null = null;
+	private transportGeneration = 0;
 	constructor(private transport: SaveTransport | null) {}
 	get dirty() {
 		const entry = this.active;
@@ -143,7 +145,7 @@ export class AuthoringSession {
 				operationId: crypto.randomUUID()
 			}
 		});
-		return this.send(entry, operation);
+		return this.run(entry, operation);
 	}
 	cancel() {
 		if (!this.canCancel) return false;
@@ -177,12 +179,12 @@ export class AuthoringSession {
 	}
 	retry() {
 		const entry = this.active;
-		return entry?.phase.kind === 'uncertain' ? this.send(entry, entry.phase.operation) : false;
+		return entry?.phase.kind === 'uncertain' ? this.run(entry, entry.phase.operation) : false;
 	}
 	remove() {
 		const entry = this.active;
 		if (!entry?.confirmed || !this.canDelete) return false;
-		return this.send(
+		return this.run(
 			entry,
 			immutable({
 				kind: 'delete',
@@ -268,7 +270,36 @@ export class AuthoringSession {
 		}
 		return { reason: '', diagnostic: null };
 	}
-	private async send(entry: AuthoringDraft, operation: Operation) {
+	async flush() {
+		const generation = this.transportGeneration;
+		if (this.running) await this.running;
+		return generation === this.transportGeneration && !this.hasUnsavedWork;
+	}
+	restartTransport() {
+		this.transportGeneration++;
+		this.running = null;
+		const entry = this.active;
+		if (entry?.phase.kind === 'saving')
+			entry.phase = {
+				kind: 'uncertain',
+				operation: entry.phase.operation,
+				message: 'The connection changed. Retry to confirm this operation.'
+			};
+	}
+	discard() {
+		this.transportGeneration++;
+		this.running = null;
+		this.active = null;
+	}
+	private run(entry: AuthoringDraft, operation: Operation) {
+		const work = this.send(entry, operation, this.transportGeneration);
+		this.running = work;
+		void work.finally(() => {
+			if (this.running === work) this.running = null;
+		});
+		return work;
+	}
+	private async send(entry: AuthoringDraft, operation: Operation, generation: number) {
 		if (this.active !== entry || entry.phase.kind === 'saving') return false;
 		this.completion = null;
 		if (!this.transport) {
@@ -282,6 +313,7 @@ export class AuthoringSession {
 		entry.phase = { kind: 'saving', operation };
 		try {
 			const result = await this.transport(operation);
+			if (this.active !== entry || generation !== this.transportGeneration) return false;
 			switch (result.status) {
 				case 'rejected':
 					entry.phase = {
@@ -306,6 +338,7 @@ export class AuthoringSession {
 			// record's observed deletion must take precedence over a conflict response.
 			this.reconcile(entry, Boolean(entry.confirmed) || result.status !== 'conflict');
 		} catch (error) {
+			if (this.active !== entry || generation !== this.transportGeneration) return false;
 			entry.phase = {
 				kind: 'uncertain',
 				operation,
