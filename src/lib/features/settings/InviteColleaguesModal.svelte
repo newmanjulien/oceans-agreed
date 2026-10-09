@@ -29,7 +29,7 @@
 			if (!isAdding) onValueChange(event.currentTarget.value);
 		}}></textarea>
 	{#if error}
-		<p class="mt-2 text-[0.72rem] text-red-700">{error}</p>
+		<p class="mt-2 text-[0.72rem] text-danger">{error}</p>
 	{/if}
 
 	{#snippet footer()}

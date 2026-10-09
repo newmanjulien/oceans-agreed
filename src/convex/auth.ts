@@ -9,7 +9,7 @@ export async function verifiedIdentity(ctx: Pick<QueryCtx, 'auth'>) {
 		throw new ConvexError('Sign in with a verified email address.');
 	return identity;
 }
-export async function requireProfile(ctx: QueryCtx, ready = true) {
+export async function requireProfile(ctx: QueryCtx) {
 	const identity = await verifiedIdentity(ctx);
 	const deleted = await ctx.db
 		.query('deletedUsers')
@@ -23,34 +23,55 @@ export async function requireProfile(ctx: QueryCtx, ready = true) {
 		.withIndex('by_identity', (q) => q.eq('identity', identity.tokenIdentifier))
 		.unique();
 	if (!profile) throw new ConvexError('Your account is still initializing.');
-	if (
-		ready &&
-		!(
-			await ctx.db
-				.query('workspace')
-				.withIndex('by_key', (q) => q.eq('key', 'shared'))
-				.unique()
-		)?.ready
-	)
-		throw new ConvexError('Existing contracts are still initializing.');
 	return profile;
 }
-export async function requirePermission(ctx: QueryCtx, permission: Permission) {
+export async function requireMembership(ctx: QueryCtx, expectedMembershipId?: Id<'memberships'>) {
 	const profile = await requireProfile(ctx);
-	assertPermission(profile.role, permission);
-	return profile;
+	// The indexed unique read participates in the transaction: concurrent joins conflict.
+	const membership = await ctx.db
+		.query('memberships')
+		.withIndex('by_profileId', (q) => q.eq('profileId', profile._id))
+		.unique();
+	if (!membership || (expectedMembershipId && membership._id !== expectedMembershipId))
+		throw new ConvexError('Your company access has changed. Reload to continue.');
+	const company = await ctx.db.get('company', membership.companyId);
+	if (!company) throw new ConvexError('This company is unavailable.');
+	return {
+		...profile,
+		membership,
+		company,
+		companyId: company._id,
+		membershipId: membership._id,
+		isOwner: company.ownerProfileId === profile._id
+	};
+}
+export type CompanyAccess = Awaited<ReturnType<typeof requireMembership>>;
+export async function requirePermission(
+	ctx: QueryCtx,
+	permission: Permission,
+	membershipId?: Id<'memberships'>
+) {
+	const access = await requireMembership(ctx, membershipId);
+	assertPermission(access.role, permission, access.isOwner);
+	return access;
+}
+export async function liveProfile(ctx: QueryCtx, profileId?: Id<'profiles'>) {
+	if (!profileId) return null;
+	const [profile, deleted] = await Promise.all([
+		ctx.db.get('profiles', profileId),
+		ctx.db
+			.query('deletedUsers')
+			.withIndex('by_profileId', (q) => q.eq('profileId', profileId))
+			.unique()
+	]);
+	return deleted ? null : profile;
 }
 export async function creatorDeleted(ctx: QueryCtx, creatorId?: Id<'profiles'>) {
-	// Unattributed contracts are never readable during an incomplete deployment/backfill.
-	if (!creatorId) return true;
-	return !!(await ctx.db
-		.query('deletedUsers')
-		.withIndex('by_profileId', (q) => q.eq('profileId', creatorId))
-		.unique());
+	return !(await liveProfile(ctx, creatorId));
 }
-export async function accessibleContract(ctx: QueryCtx, contract: Doc<'savedContracts'> | null) {
-	return contract && !(await creatorDeleted(ctx, contract.creatorId)) ? contract : null;
+export function accessibleContract(contract: Doc<'savedContracts'> | null, access: CompanyAccess) {
+	return contract?.companyId === access.companyId ? contract : null;
 }
-export function scopedOperation(profile: Doc<'profiles'>, operationId: string) {
-	return `${profile._id}:${operationId}`;
+export function scopedOperation(access: Pick<CompanyAccess, 'membershipId'>, operationId: string) {
+	return `${access.membershipId}:${operationId}`;
 }

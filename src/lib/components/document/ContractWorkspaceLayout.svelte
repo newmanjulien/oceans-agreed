@@ -51,7 +51,7 @@
 		<!-- Programmatic focus only; inert previews have no focus target. -->
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 		<div
-			class="document-stage relative"
+			class="document-stage relative focus:outline-none"
 			bind:this={documentStageElement}
 			tabindex={interactive ? -1 : undefined}
 			style:width={`${displayedPageWidth}px`}

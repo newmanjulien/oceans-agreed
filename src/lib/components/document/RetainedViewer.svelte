@@ -27,7 +27,7 @@
 		bind:this={element}
 		data-document-resource={entry.id}
 		class:dormant={!readyToShow}
-		inert={!entry.active || bindings?.interactive === false}
+		inert={!entry.active}
 		aria-hidden={!readyToShow}
 	>
 		<ContractViewer
@@ -38,6 +38,9 @@
 			priority={entry.priority}
 			selectedConcessions={bindings?.selectedConcessions ?? entry.choices}
 			previewChanges={bindings?.previewChanges}
+			reviewTags={entry.active ? bindings?.reviewTags : undefined}
+			reviewNavigation={entry.active ? bindings?.reviewNavigation : undefined}
+			onReviewDecision={bindings?.onReviewDecision}
 			hasPanel={bindings?.hasPanel}
 			followScroll={bindings?.followScroll}
 			selectedAnnotationId={bindings?.selectedAnnotationId}
@@ -45,6 +48,7 @@
 			panelSource={bindings?.panelSource}
 			picking={bindings?.picking}
 			allowPlaybookNavigation={bindings?.allowPlaybookNavigation ?? false}
+			playbookNavigationReady={bindings?.playbookNavigationReady}
 			onRemoveConcession={bindings?.onRemoveConcession ?? (() => {})}
 			onSelect={bindings?.onSelect ?? (() => false)}
 		>

@@ -7,24 +7,31 @@ import type { ReadyContract } from '../../src/lib/contract/snapshot-storage';
 import type { Id } from '../../src/convex/_generated/dataModel';
 import { block, item } from './fixtures';
 import { observeSnapshotStorage } from './snapshot-storage-observer';
+import { setCacheIdentity } from '../../src/lib/contract/browser-storage';
 
 const id = 'synthetic-contract' as Id<'savedContracts'>;
 const itemId = 'synthetic-item' as Id<'playbookItems'>;
+const companyId = 'synthetic-company' as Id<'company'>;
 function fixture(): ReadyContract {
 	return {
 		id,
 		status: 'ready',
 		contract: {
 			_id: id,
+			companyId,
+			templateVersionId: 'synthetic-template' as Id<'templateVersions'>,
 			_creationTime: 1,
 			companyName: 'Synthetic Buyer',
 			savedAt: 123,
 			selectedConcessions: {},
-			revision: 0,
-			blockCount: 1,
-			itemCount: 1
+			revision: 0
 		},
-		snapshot: { blocks: [block], items: [{ ...item, _id: itemId, _creationTime: 1 }] }
+		snapshot: {
+			blockCount: 1,
+			itemCount: 1,
+			blocks: [block],
+			items: [{ ...item, companyId, _id: itemId, _creationTime: 1 }]
+		}
 	};
 }
 
@@ -35,6 +42,10 @@ describe('snapshot caching work', () => {
 		storage = observeSnapshotStorage();
 		vi.stubGlobal('document', Object.assign(new EventTarget(), { hidden: false }));
 		vi.stubGlobal('window', {});
+		setCacheIdentity({
+			profileId: 'synthetic-profile' as Id<'profiles'>,
+			membershipId: 'synthetic-membership' as Id<'memberships'>
+		});
 	});
 
 	afterEach(async () => {

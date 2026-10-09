@@ -1,4 +1,4 @@
-import { requireProfile, scopedOperation } from './auth';
+import { requireMembership, scopedOperation } from './auth';
 import { assertAuthoringAvailable, publishTemplate } from './templates';
 import { v } from 'convex/values';
 import { mutation } from './_generated/server';
@@ -34,6 +34,7 @@ const missing = v.object({ status: v.literal('missing') });
 /** One atomic snapshot per operation. Replays acknowledge; they never write again. */
 export const savePlaybookItem = mutation({
 	args: {
+		membershipId: v.id('memberships'),
 		id: v.optional(v.id('playbookItems')),
 		item: playbookItem,
 		expectedRevision: v.number(),
@@ -45,8 +46,8 @@ export const savePlaybookItem = mutation({
 		v.object({ status: v.literal('rejected'), message: v.string() }),
 		missing
 	),
-	handler: async (ctx, { id, item, expectedRevision, operationId }) => {
-		const profile = await requireProfile(ctx);
+	handler: async (ctx, { membershipId, id, item, expectedRevision, operationId }) => {
+		const profile = await requireMembership(ctx, membershipId);
 		if (
 			!Number.isSafeInteger(expectedRevision) ||
 			expectedRevision < 0 ||
@@ -62,7 +63,8 @@ export const savePlaybookItem = mutation({
 				.unique();
 			if (receipt) {
 				const current = await ctx.db.get('playbookItems', receipt.itemId);
-				if (!current) return { status: 'missing' as const };
+				if (!current || current.companyId !== profile.companyId)
+					return { status: 'missing' as const };
 				return {
 					status:
 						current.lastOperationId === operationId && current.lastOperationCaller === profile._id
@@ -71,9 +73,10 @@ export const savePlaybookItem = mutation({
 					item: current
 				};
 			}
-			await assertAuthoringAvailable(ctx);
+			await assertAuthoringAvailable(ctx, profile.companyId);
 			const created = {
 				...item,
+				companyId: profile.companyId,
 				revision: 1,
 				lastOperationCaller: profile._id,
 				lastOperationId: operationId
@@ -85,41 +88,48 @@ export const savePlaybookItem = mutation({
 				operationId: scopedOperation(profile, operationId),
 				itemId: newId
 			});
-			await publishTemplate(ctx);
+			await publishTemplate(ctx, profile.companyId);
 			return { status: 'saved' as const, item: (await ctx.db.get('playbookItems', newId))! };
 		}
 		const current = await ctx.db.get('playbookItems', id);
-		if (!current) return { status: 'missing' as const };
+		if (!current || current.companyId !== profile.companyId) return { status: 'missing' as const };
 		if (current.lastOperationId === operationId && current.lastOperationCaller === profile._id)
 			return { status: 'saved' as const, item: current };
 		if ((current.revision ?? 0) !== expectedRevision)
 			return { status: 'conflict' as const, item: current };
-		await assertAuthoringAvailable(ctx);
+		await assertAuthoringAvailable(ctx, profile.companyId);
 		const rejection = await validate(item, current);
 		if (rejection) return rejection;
 		await ctx.db.replace('playbookItems', id, {
 			...item,
+			companyId: profile.companyId,
 			revision: expectedRevision + 1,
 			lastOperationCaller: profile._id,
 			lastOperationId: operationId
 		});
-		await publishTemplate(ctx);
+		await publishTemplate(ctx, profile.companyId);
 		return { status: 'saved' as const, item: (await ctx.db.get('playbookItems', id))! };
 	}
 });
 
 export const deletePlaybookItem = mutation({
-	args: { id: v.id('playbookItems'), expectedRevision: v.number() },
+	args: {
+		membershipId: v.id('memberships'),
+		id: v.id('playbookItems'),
+		expectedRevision: v.number()
+	},
 	returns: v.union(v.object({ status: v.literal('deleted') }), conflict),
-	handler: async (ctx, { id, expectedRevision }) => {
-		await requireProfile(ctx);
+	handler: async (ctx, { membershipId, id, expectedRevision }) => {
+		const profile = await requireMembership(ctx, membershipId);
 		const current = await ctx.db.get('playbookItems', id);
+		if (current && current.companyId !== profile.companyId)
+			throw new Error('This item is unavailable.');
 		if (current && (current.revision ?? 0) !== expectedRevision)
 			return { status: 'conflict' as const, item: current };
 		if (current) {
-			await assertAuthoringAvailable(ctx);
+			await assertAuthoringAvailable(ctx, profile.companyId);
 			await ctx.db.delete('playbookItems', id);
-			await publishTemplate(ctx);
+			await publishTemplate(ctx, profile.companyId);
 		}
 		return { status: 'deleted' as const };
 	}

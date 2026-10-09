@@ -10,6 +10,7 @@ type SignInEmailCodeFactor = Extract<
 export type ClerkEmailCodeAuthController = {
 	sendJoinCode(email: string): Promise<void>;
 	sendLoginCode(email: string): Promise<void>;
+	sendInvitationCode(email: string): Promise<void>;
 	acceptTicket(ticket: string): Promise<void>;
 	verifyCode(code: string): Promise<void>;
 	resendCode(): Promise<void>;
@@ -34,8 +35,9 @@ export function createClerkEmailCodeAuthController({
 }: ClerkEmailCodeAuthControllerDeps): ClerkEmailCodeAuthController {
 	let generation = 0;
 	let attempt:
-		{ mode: 'signIn'; id: string; emailAddressId: string } | { mode: 'signUp'; id: string } | null =
-		null;
+		| { mode: 'signIn' | 'invitation'; id: string; emailAddressId?: string }
+		| { mode: 'signUp'; id: string }
+		| null = null;
 
 	function reset() {
 		generation++;
@@ -70,21 +72,30 @@ export function createClerkEmailCodeAuthController({
 		return resource;
 	}
 
-	function begin(email: string, mode: 'signIn' | 'signUp') {
+	function begin(email: string, mode: 'signIn' | 'signUp' | 'invitation') {
 		const normalized = email.trim().toLowerCase();
 		if (!normalized) return Promise.reject(new Error('Enter your work email.'));
 		reset();
 		return run(async (current) => {
-			if (mode === 'signIn') {
-				await mutate(current, requireResource(getSignIn()).create({ identifier: normalized }));
+			if (mode !== 'signUp') {
+				await mutate(
+					current,
+					requireResource(getSignIn()).create({
+						identifier: normalized,
+						...(mode === 'invitation' ? { signUpIfMissing: true } : {})
+					})
+				);
 				const signIn = requireResource(getSignIn());
-				const factor = signIn.supportedFirstFactors.find(isEmailCodeFactor);
-				if (!factor) throw new Error('Email code sign-in is not enabled in Clerk.');
+				const factor =
+					mode === 'signIn' ? signIn.supportedFirstFactors.find(isEmailCodeFactor) : undefined;
+				if (mode === 'signIn' && !factor)
+					throw new Error('Email code sign-in is not enabled in Clerk.');
 				if (!signIn.id) throw new Error('Start the email verification again.');
 				const id = signIn.id;
-				await mutate(current, signIn.emailCode.sendCode({ emailAddressId: factor.emailAddressId }));
+				const emailAddressId = factor?.emailAddressId;
+				await mutate(current, signIn.emailCode.sendCode({ emailAddressId }));
 				requireResource(getSignIn(), id);
-				attempt = { mode, id, emailAddressId: factor.emailAddressId };
+				attempt = { mode, id, emailAddressId };
 			} else {
 				await mutate(current, requireResource(getSignUp()).create({ emailAddress: normalized }));
 				const signUp = requireResource(getSignUp());
@@ -103,15 +114,27 @@ export function createClerkEmailCodeAuthController({
 		return run(async (current) => {
 			if (!attempt) throw new Error('Start the email verification again.');
 			const { mode, id } = attempt;
-			if (mode === 'signIn') {
+			if (mode !== 'signUp') {
 				const signIn = requireResource(getSignIn(), id);
-				await mutate(current, signIn.emailCode.verifyCode({ code: normalizedCode }));
+				if (signIn.status !== 'complete' && !(mode === 'invitation' && signIn.isTransferable))
+					await mutate(current, signIn.emailCode.verifyCode({ code: normalizedCode }));
 				const verified = requireResource(getSignIn(), id);
+				if (mode === 'invitation' && verified.isTransferable) {
+					// Clerk carries the verified email into signup; no second code or account choice.
+					await mutate(current, requireResource(getSignUp()).create({ transfer: true }));
+					const signUp = requireResource(getSignUp());
+					if (!signUp.id) throw new Error('Start the email verification again.');
+					attempt = { mode: 'signUp', id: signUp.id };
+					assertSignUpComplete(signUp);
+					await mutate(current, signUp.finalize());
+					return;
+				}
 				assertSignInComplete(verified);
 				await mutate(current, verified.finalize());
 			} else {
 				const signUp = requireResource(getSignUp(), id);
-				await mutate(current, signUp.verifications.verifyEmailCode({ code: normalizedCode }));
+				if (signUp.status !== 'complete')
+					await mutate(current, signUp.verifications.verifyEmailCode({ code: normalizedCode }));
 				const verified = requireResource(getSignUp(), id);
 				assertSignUpComplete(verified);
 				await mutate(current, verified.finalize());
@@ -122,7 +145,7 @@ export function createClerkEmailCodeAuthController({
 	function resendCode() {
 		return run(async (current) => {
 			if (!attempt) throw new Error('Start the email verification again.');
-			if (attempt.mode === 'signIn') {
+			if (attempt.mode !== 'signUp') {
 				await mutate(
 					current,
 					requireResource(getSignIn(), attempt.id).emailCode.sendCode({
@@ -154,6 +177,7 @@ export function createClerkEmailCodeAuthController({
 	return {
 		sendJoinCode: (email) => begin(email, 'signUp'),
 		sendLoginCode: (email) => begin(email, 'signIn'),
+		sendInvitationCode: (email) => begin(email, 'invitation'),
 		acceptTicket,
 		verifyCode,
 		resendCode,

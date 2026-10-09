@@ -9,7 +9,7 @@ export const block: BaselineBlock = {
 	content: [{ kind: 'text', sourceKey: 'text-1', text: 'Synthetic contract.' }]
 };
 
-export const item: Omit<Doc<'playbookItems'>, '_id' | '_creationTime'> = {
+export const item: Omit<Doc<'playbookItems'>, '_id' | '_creationTime' | 'companyId'> = {
 	triggers: [],
 	concessions: [
 		{ id: 'preferred', tier: 'preferred', description: 'Synthetic choice.', changes: [] }
@@ -30,8 +30,16 @@ export async function initializeViewer(ctx: MutationCtx) {
 		clerkId: identity.subject,
 		email: identity.email,
 		name: 'Rep',
-		role: 'rep'
+		role: 'admin'
 	});
-	await ctx.db.insert('workspace', { key: 'shared', legacyOwnerId: id, ready: true });
-	return id;
+	const companyId = await ctx.db.insert('company', {
+		name: 'Synthetic company',
+		ownerProfileId: id,
+		approvalEmail: 'approver@example.com'
+	});
+	const membershipId = await ctx.db.insert('memberships', {
+		companyId,
+		profileId: id
+	});
+	return { profileId: id, companyId, membershipId };
 }

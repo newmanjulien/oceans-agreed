@@ -4,8 +4,22 @@ import zlib from 'node:zlib';
 const manifest = JSON.parse(
 	fs.readFileSync('.svelte-kit/output/client/.vite/manifest.json', 'utf8')
 );
-// SvelteKit's root layout, protected layout and dashboard page.
-const roots = [0, 2, 4].map((id) => `.svelte-kit/generated/client-optimized/nodes/${id}.js`);
+// Find route nodes by their source components; route-group changes can reorder node IDs.
+const components = new Set([
+	'src/routes/+layout.svelte',
+	'src/routes/(workspace)/+layout.svelte',
+	'src/routes/(workspace)/+page.svelte'
+]);
+const directory = '.svelte-kit/generated/client-optimized/nodes';
+const roots = fs
+	.readdirSync(directory)
+	.filter((file) => {
+		const source = fs.readFileSync(`${directory}/${file}`, 'utf8');
+		return [...components].some((component) => source.includes(`/${component}\"`));
+	})
+	.map((file) => `${directory}/${file}`);
+if (roots.length !== components.size)
+	throw new Error('Could not identify all workspace route nodes.');
 const visited = new Set();
 function visit(key) {
 	if (visited.has(key)) return;

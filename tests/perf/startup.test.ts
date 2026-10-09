@@ -53,7 +53,6 @@ it('reads returning accounts and provisions missing state once without restartin
 	const t = convexTest(schema, modules).withIdentity(identity);
 	await t.run(async (ctx) => {
 		await initializeViewer(ctx);
-		await ctx.db.insert('company', { key: 'shared', name: 'Oceans' });
 	});
 	const mutation = vi.fn(t.mutation.bind(t));
 	const client = { query: t.query.bind(t), mutation };
@@ -71,17 +70,19 @@ it('reads returning accounts and provisions missing state once without restartin
 	const newClient = { query: newAccount.query.bind(newAccount), mutation: newMutation };
 	const prepareNew = liveAccount(newClient);
 	const provisioned = await prepareNew();
-	expect(provisioned?.ready).toBe(true);
+	expect(Boolean(provisioned && !provisioned.needsInitialization)).toBe(true);
 	await prepareNew();
 	expect(newMutation).toHaveBeenCalledExactlyOnceWith(api.profiles.initialize, {});
 	await t.run(async ({ db }) => {
-		const workspace = await db
-			.query('workspace')
-			.withIndex('by_key', (q) => q.eq('key', 'shared'))
-			.unique();
-		await db.patch('workspace', workspace!._id, { ready: false });
+		const company = await db.query('company').first();
+		await db.insert('currentTemplate', {
+			companyId: company!._id,
+			maintenance: true
+		});
 	});
-	expect((await prepare())?.ready).toBe(false);
+	const maintained = await prepare();
+	expect(Boolean(maintained && !maintained.needsInitialization)).toBe(true);
+	expect(maintained?.templateReady).toBe(false);
 	expect(mutation).not.toHaveBeenCalled();
 	expect(await t.run(({ db }) => db.system.query('_scheduled_functions').collect())).toHaveLength(
 		0

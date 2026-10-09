@@ -25,9 +25,11 @@
 	const protect = protectedInteraction();
 	let {
 		variant = 'rep',
+		isAdmin = false,
 		feedback = null
 	}: {
 		variant?: HelpVariant;
+		isAdmin?: boolean;
 		feedback?: OperationStatus | null;
 	} = $props();
 	const { source, renderer, viewer } = getContractWorkspace();
@@ -198,4 +200,4 @@
 	/>
 </div>
 
-{#if helpVisible}<HelpModal {variant} onClose={() => (helpVisible = false)} />{/if}
+{#if helpVisible}<HelpModal {variant} {isAdmin} onClose={() => (helpVisible = false)} />{/if}

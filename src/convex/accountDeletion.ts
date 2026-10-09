@@ -1,7 +1,7 @@
-import { v } from 'convex/values';
-import { internalMutation, internalQuery } from './_generated/server';
+import { v, ConvexError } from 'convex/values';
+import { internalMutation, internalQuery, query } from './_generated/server';
 import { internal } from './_generated/api';
-import { requireProfile } from './auth';
+import { requireProfile, creatorDeleted } from './auth';
 import type { MutationCtx } from './_generated/server';
 import type { Doc } from './_generated/dataModel';
 
@@ -26,12 +26,17 @@ async function ensureCleanup(ctx: MutationCtx, marker: Doc<'deletedUsers'>) {
 	await scheduleCleanup(ctx, marker);
 }
 
-export const caller = internalQuery({
+export const authorize = query({
 	args: {},
-	returns: v.object({ id: v.id('profiles'), issuer: v.string() }),
+	returns: v.null(),
 	handler: async (ctx) => {
 		const profile = await requireProfile(ctx);
-		return { id: profile._id, issuer: profile.issuer };
+		const owned = await ctx.db
+			.query('company')
+			.withIndex('by_ownerProfileId', (q) => q.eq('ownerProfileId', profile._id))
+			.first();
+		if (owned) throw new ConvexError('Transfer company ownership before deleting your account.');
+		return null;
 	}
 });
 export const mark = internalMutation({
@@ -64,14 +69,6 @@ export const resume = internalMutation({
 	args: {},
 	returns: v.null(),
 	handler: async (ctx) => {
-		const workspace = await ctx.db
-			.query('workspace')
-			.withIndex('by_key', (q) => q.eq('key', 'shared'))
-			.unique();
-		if (workspace && !workspace.ready) {
-			await ctx.scheduler.runAfter(0, internal.profiles.attributeLegacy, {});
-			return null;
-		}
 		const markers = await ctx.db
 			.query('deletedUsers')
 			.withIndex('by_complete', (q) => q.eq('complete', false))
@@ -81,49 +78,47 @@ export const resume = internalMutation({
 	}
 });
 export const clean = internalMutation({
-	args: { markerId: v.id('deletedUsers'), generation: v.optional(v.number()) },
+	args: { markerId: v.id('deletedUsers'), generation: v.number() },
 	returns: v.null(),
 	handler: async (ctx, { markerId, generation }) => {
 		const marker = await ctx.db.get('deletedUsers', markerId);
-		// Legacy jobs have no generation; once a chain is tracked, all older jobs become no-ops.
+		// A retried or superseded cleanup job cannot continue an older chain.
 		if (!marker || marker.complete || generation !== marker.cleanupGeneration) return null;
-		const workspace = await ctx.db
-			.query('workspace')
-			.withIndex('by_key', (q) => q.eq('key', 'shared'))
-			.unique();
-		if (workspace && !workspace.ready) return null;
 		if (marker.profileId) {
-			// One contract at a time; at most eight snapshot records (each may approach 1 MB) removed per transaction.
-			const contract = await ctx.db
-				.query('savedContracts')
-				.withIndex('by_creatorId', (q) => q.eq('creatorId', marker.profileId))
+			const profileId = marker.profileId;
+			const membership = await ctx.db
+				.query('memberships')
+				.withIndex('by_profileId', (q) => q.eq('profileId', profileId))
+				.unique();
+			const owned = await ctx.db
+				.query('company')
+				.withIndex('by_ownerProfileId', (q) => q.eq('ownerProfileId', profileId))
 				.first();
-			if (contract) {
-				const approval = await ctx.db
-					.query('approvalRequests')
-					.withIndex('by_contractId', (q) => q.eq('contractId', contract._id))
-					.unique();
-				if (approval) {
-					const job = await ctx.db.system.get('_scheduled_functions', approval.sendJobId);
-					if (job?.state.kind === 'pending' || job?.state.kind === 'inProgress')
-						await ctx.scheduler.cancel(approval.sendJobId);
-					await ctx.db.delete('approvalRequests', approval._id);
+			if (owned) {
+				const candidates = await ctx.db
+					.query('memberships')
+					.withIndex('by_companyId', (q) => q.eq('companyId', owned._id))
+					.paginate({ cursor: marker.successorCursor ?? null, numItems: 25 });
+				let successor;
+				for (const candidate of candidates.page) {
+					if (
+						candidate.profileId !== profileId &&
+						!(await creatorDeleted(ctx, candidate.profileId))
+					) {
+						successor = candidate;
+						break;
+					}
 				}
-				const blocks = await ctx.db
-					.query('contractSnapshotBlocks')
-					.withIndex('by_contractId', (q) => q.eq('contractId', contract._id))
-					.take(4);
-				const items = await ctx.db
-					.query('contractSnapshotItems')
-					.withIndex('by_contractId', (q) => q.eq('contractId', contract._id))
-					.take(4);
-				for (const row of blocks) await ctx.db.delete('contractSnapshotBlocks', row._id);
-				for (const row of items) await ctx.db.delete('contractSnapshotItems', row._id);
-				if (blocks.length < 4 && items.length < 4)
-					await ctx.db.delete('savedContracts', contract._id);
-				await scheduleCleanup(ctx, marker);
-				return null;
+				if (!successor && !candidates.isDone) {
+					await ctx.db.patch('deletedUsers', marker._id, {
+						successorCursor: candidates.continueCursor
+					});
+					await scheduleCleanup(ctx, marker);
+					return null;
+				}
+				await ctx.db.patch('company', owned._id, { ownerProfileId: successor?.profileId });
 			}
+			if (membership) await ctx.db.delete('memberships', membership._id);
 			const profile = await ctx.db.get('profiles', marker.profileId);
 			if (profile?.avatarId) await ctx.storage.delete(profile.avatarId);
 			if (profile) await ctx.db.delete('profiles', profile._id);

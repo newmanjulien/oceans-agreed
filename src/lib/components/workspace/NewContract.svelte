@@ -3,7 +3,7 @@
 	import { beforeNavigate, goto, preloadCode } from '$app/navigation';
 	import { useConvexClient, useQuery } from 'convex-svelte';
 	import { ConvexError } from 'convex/values';
-	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import { useViewer, useViewerSession } from '$lib/auth/viewer-session.svelte';
 	import { ConnectionInterruptedError } from '$lib/auth/convex-session.svelte';
 	import { api } from '../../../convex/_generated/api';
 	import type { Id } from '../../../convex/_generated/dataModel';
@@ -23,15 +23,17 @@
 		onOpen,
 		showPreview = true
 	}: {
-		onOpen: (id: Id<'savedContracts'>, seed: ReadyContract) => Promise<boolean>;
+		onOpen: (id: Id<'savedContracts'>) => Promise<boolean>;
 		showPreview?: boolean;
 	} = $props();
 	const client = useConvexClient();
 	const session = useViewerSession();
+	const viewer = useViewer();
+	const membershipId = viewer().membership.id;
 	const cache = getContractSnapshotCache();
 	const resources = getDocumentResources();
 	let createdId = $state<Id<'savedContracts'> | null>(null);
-	const published = useQuery(api.templates.current, () => (createdId ? 'skip' : {}));
+	const published = useQuery(api.templates.current, () => (createdId ? 'skip' : { membershipId }));
 	const preview = $derived(published.error ? undefined : published.data?.snapshot);
 	let draft = $state.raw<DocumentResource>();
 	let draftSnapshot: ContractSnapshot | undefined;
@@ -95,7 +97,10 @@
 					args: { companyName, operationId: crypto.randomUUID() },
 					uncertain: false
 				};
-				const result = await client.mutation(api.savedContracts.create, creationRequest.args);
+				const result = await client.mutation(api.savedContracts.create, {
+					...creationRequest.args,
+					membershipId
+				});
 				if (!active) return;
 				if (session.transportGeneration !== generation) throw new ConnectionInterruptedError();
 				if (result.status === 'deleted') {
@@ -112,7 +117,7 @@
 			const snapshot =
 				draftVersion === versionId && draftSnapshot
 					? draftSnapshot
-					: await client.query(api.templates.version, { versionId });
+					: await client.query(api.templates.version, { membershipId, versionId });
 			if (!active) return;
 			if (session.transportGeneration !== generation) throw new ConnectionInterruptedError();
 			draftVersion = versionId;
@@ -127,11 +132,10 @@
 				resources.adopt(draft, data);
 				creationPhase('adopted');
 			}
-			const seeded = cache.seedConfirmed(data);
-			if (!seeded) throw new Error('Contract unavailable');
+			if (!cache.seedConfirmed(data)) throw new Error('Contract unavailable');
 			creationPhase('snapshot-ready');
 			creationPhase('navigation-start');
-			if (!(await onOpen(createdId, seeded))) throw new Error('navigation');
+			if (!(await onOpen(createdId))) throw new Error('navigation');
 			if (active) creationPhase('displayed');
 		} catch (cause) {
 			if (!active) return;

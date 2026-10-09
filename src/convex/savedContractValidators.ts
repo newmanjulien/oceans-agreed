@@ -1,10 +1,12 @@
 import { v } from 'convex/values';
 import { baselineBlock } from './sourceValidators';
 import schema from './schema';
-import { selections } from './contractValidators';
+import { selections, concessionReviews } from './contractValidators';
 
 export { selections };
 export const snapshot = v.object({
+	blockCount: v.number(),
+	itemCount: v.number(),
 	blocks: v.array(baselineBlock),
 	items: v.array(schema.doc('playbookItems'))
 });
@@ -17,6 +19,7 @@ export const contractCard = schema
 export const contractState = v.object({
 	companyName: v.string(),
 	selectedConcessions: selections,
+	reviews: v.optional(concessionReviews),
 	revision: v.number(),
 	lastOperationId: v.union(v.string(), v.null())
 });

@@ -14,17 +14,25 @@ publish too. Replayed operations and missing-item deletions publish nothing.
 Publication preserves original Playbook Item IDs and indexed selected-item lookup.
 The complete snapshot must satisfy existing semantic checks, supported row counts,
 and the 8 MB UTF-8 bound. Remaining transaction write/query capacity is checked
-before and during copying; a failure rolls back both authoring and publication.
+before copying and once before updating the pointer; a failure rolls back both
+authoring and publication. Publication serializes the snapshot once for sizing.
 
 Version content is immutable and retained indefinitely in this release. Storage
 therefore grows with each successful template save, including instruction-only
 saves. The measured template contains 113 blocks and 56 items: each publication
 adds 169 content rows plus version metadata. Garbage collection is deferred.
 
-Existing contracts retain their per-contract snapshots without backfill. Shared
-helpers load complete snapshots, blocks, and indexed selected items from either
-format. Saving, approval validation, and approval descriptions use these helpers;
-contract deletion removes only its own data and approval work, never a version.
+Every saved contract requires a published template version. Shared helpers validate
+the version's company before loading complete snapshots, blocks, or indexed selected
+items. Version metadata owns completeness counts; saved contracts only reference
+their version. Saving, approval validation, and approval descriptions use these helpers.
+Contract deletion removes the contract and its approval work, never the shared version.
+The fresh development reset retired per-contract snapshot tables and snapshot hashes.
+
+Memory and IndexedDB caches retain immutable content once per template version,
+with separate metadata per contract. Both retain the 24-contract and 32 MB limits;
+byte limits count shared content once, and metadata updates preserve snapshot identity.
+IndexedDB upgrades rebuild only the optional snapshot cache, leaving draft journals intact.
 
 Creation checks its retry receipt before the current pointer and version metadata,
 then inserts exactly the contract and receipt. It does not read or compile template
@@ -115,7 +123,7 @@ Automated regression checks cover initialization idempotence/concurrency and its
 race with admin publication; immutable old content; publication replay/no-op behavior;
 rollback after partial copying and invalid-template rejection; latest-version
 creation, retries, and deleted receipts; two creation writes with no content reads;
-both snapshot formats; saving and approval description reads; import maintenance;
+saved versions after live-item deletion; saving and approval description reads; import maintenance;
 exact-reference cache seeding, newer revision reconciliation, and deletion protection.
 External email delivery is stubbed. Existing save, scheduling, rendering, and cache
 performance assertions remain in place.
@@ -148,25 +156,20 @@ legacy fallback removed. No production deployment was performed.
 The final development check confirmed complete live-template parity and no remaining
 temporary browser-test contracts.
 
-Production rollout requires separate authorization and the same staged sequence:
+This historical staged rollout no longer applies to the strict schema. The fresh
+development reset removed legacy contracts; new contracts always reference a
+published version. Production changes require separate authorization and a reviewed
+procedure for any incompatible records before deploying this schema.
 
-1. Deploy compatible schema/read support and atomic publication with the legacy
-   no-pointer creation fallback temporarily retained. Do not deploy the final
-   pointer-required creation handler first on an uninitialized deployment.
-2. Run `templates:initialize` on the explicitly identified target. Inspect
-   `templates:current` and verify complete source/item parity and the current pointer.
-   Initialization is idempotent and cannot replace a newer admin publication.
-3. Deploy the final optimized creation handler and preparation frontend only after
-   pointer verification. Existing contracts continue using their original snapshots.
-
-`npm run convex:seed` retains its development-only overwrite guard. It enters
-`templates:beginImport` before changing data, verifies the final live seed, and calls
-`templates:finishImport` to atomically publish the complete version and release
-maintenance. Even an already-complete supported seed run republishes after final
-verification. Imports block creation and authoring until publication completes.
-An interrupted or failed import intentionally remains in maintenance; resume the
-verified workflow rather than clearing maintenance before publication. Saved
-contracts remain readable and editable against their immutable snapshots. Other
-imports must use this same begin/import/verify/finish sequence on their explicitly
-identified target. The reconciliation adapter also exercises publication while
-checking business-data preservation; it does not deploy or import production data.
+The original publication rehearsal above predates private companies. Current
+initial imports use `npm run convex:seed -- --company-id COMPANY_ID` on an explicitly
+configured development/local deployment. The scoped `companyTemplateImport`
+workflow fingerprints content, persists batch counts, verifies the committed
+prefix, and publishes once through `finish`. It resumes interrupted initial imports
+without overwriting edited content or republishing an unchanged completed import.
+Imports block creation and authoring until publication completes; saved contracts
+retain their immutable snapshots. After a fresh development reset, create the
+account and company through normal signup, then seed the actual company ID. Follow
+the current [private-company rollout runbook](private-companies-rollout.md) for
+backup, reset, strict-schema deployment, and publication checks. Production
+operations require a separately reviewed procedure and explicit authorization.

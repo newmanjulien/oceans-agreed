@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy, untrack, tick } from 'svelte';
 	import { useAuth, useQuery } from 'convex-svelte';
-	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import { useViewer, useViewerSession } from '$lib/auth/viewer-session.svelte';
 	import { ReadAttempt } from '$lib/auth/attempt';
 	import { api } from '../../../convex/_generated/api';
 	import type { ContractRouteData } from '$lib/contract/saved';
@@ -14,20 +14,16 @@
 	import RepWorkspace from './RepWorkspace.svelte';
 	let {
 		id,
-		seed,
 		onVisible,
 		onFailure
 	}: {
 		id: string;
-		seed?: Extract<ContractRouteData, { status: 'ready' }>;
 		onVisible?: () => void;
 		onFailure?: () => void;
 	} = $props();
 	let mounted = $state(false);
-	let snapshot = $state.raw<ContractRouteData | undefined>(untrack(() => seed));
-	let ready = $state.raw<Extract<ContractRouteData, { status: 'ready' }> | undefined>(
-		untrack(() => seed)
-	);
+	let snapshot = $state.raw<ContractRouteData | undefined>();
+	let ready = $state.raw<Extract<ContractRouteData, { status: 'ready' }> | undefined>(undefined);
 	let attempt = $state(0);
 	let openingOutcome = $state<'pending' | 'visible' | 'failed'>('pending');
 	let openingError = $state(false);
@@ -36,8 +32,10 @@
 	// This owner survives initialization and supplies the workspace's editing state.
 	const auth = useAuth();
 	const session = useViewerSession();
+	const viewer = useViewer();
+	const membershipId = viewer().membership.id;
 	const metadata = useQuery(api.savedContracts.state, () =>
-		mounted && auth.isAuthenticated ? { id } : 'skip'
+		mounted && auth.isAuthenticated ? { membershipId, id } : 'skip'
 	);
 	onMount(() => {
 		mounted = true;
@@ -102,12 +100,16 @@
 		if (!data || ready) return;
 		untrack(() => {
 			if (data.status !== 'ready' || state === null || error || openingError) return;
-			// Cached selections may be prepared offscreen while validation is pending.
+			// Validate current membership before preparing any cached document.
+			if (!state) return;
+			if (data.contract.companyId !== viewer().company.id) {
+				openingError = true;
+				return;
+			}
 			if (resources && !releaseOpening) {
 				resources.acquireContract(data);
 				releaseOpening = resources.beginOpen(id);
 			}
-			if (!state) return;
 			getContractSnapshotCache().updateState(id, state);
 			ready = {
 				...data,

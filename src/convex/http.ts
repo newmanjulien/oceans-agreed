@@ -51,9 +51,17 @@ http.route({
 		try {
 			if (!(await ctx.auth.getUserIdentity()))
 				return new Response('Sign in required.', { status: 401 });
-			const company = new URL(request.url).searchParams.get('company') === 'true';
+			const params = new URL(request.url).searchParams;
+			const company = params.get('company') === 'true';
+			const membershipId = params.get('membershipId') as
+				import('./_generated/dataModel').Id<'memberships'> | null;
+			if (company && !membershipId)
+				return new Response('Company access is required.', { status: 403 });
 			try {
-				await ctx.runQuery(internal.settings.authorizeAvatarUpload, { company });
+				await ctx.runQuery(internal.settings.authorizeAvatarUpload, {
+					company,
+					membershipId: membershipId ?? undefined
+				});
 			} catch (error) {
 				if (error instanceof ConvexError && typeof error.data === 'string')
 					return new Response(error.data, { status: 403 });
@@ -71,6 +79,7 @@ http.route({
 			try {
 				await ctx.runMutation(internal.settings.setAvatar, {
 					avatarId,
+					membershipId: membershipId ?? undefined,
 					company
 				});
 			} catch (error) {

@@ -18,7 +18,6 @@ export const handle: Handle = async ({ event, resolve }) => {
 	if (!env.PUBLIC_CLERK_PUBLISHABLE_KEY || !privateEnv.CLERK_SECRET_KEY) return resolve(event);
 	const callback = callbackParameters.some((name) => event.url.searchParams.has(name));
 	if (!callback && ['/login', '/join'].includes(event.url.pathname)) {
-		event.setHeaders({ 'cache-control': 'private, no-store' });
 		return resolve(event);
 	}
 	// Cookie presence selects a route only. Protected loads still verify identity.

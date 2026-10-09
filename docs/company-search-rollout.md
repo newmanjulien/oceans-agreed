@@ -14,6 +14,11 @@ The sequence below documents the rollout for another explicitly authorized targe
 The final working copy no longer contains the legacy table or cleanup function;
 prepare the intermediate revisions before using this sequence on another target.
 
+The current private-company backend scopes search by `companyId` and uses
+`by_companyId_and_savedAt` for blank browsing. The global `by_savedAt` index has
+been removed. Follow the [private-company rollout](private-companies-rollout.md)
+for the current schema and authorization requirements.
+
 ## 1. Stage the index without switching functions
 
 Prepare a separate deployment revision from the complete Phase 6 implementation.

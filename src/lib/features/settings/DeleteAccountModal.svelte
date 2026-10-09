@@ -3,6 +3,8 @@
 	import { onDestroy } from 'svelte';
 	import type { SessionResource, UserResource } from '@clerk/shared/types';
 	import { useClerkContext } from 'svelte-clerk';
+	import { useConvexClient } from 'convex-svelte';
+	import { api } from '../../../convex/_generated/api';
 	import {
 		createClerkSessionVerification,
 		type ClerkSessionVerificationFactor,
@@ -23,6 +25,7 @@
 
 	let { open, onClose }: Props = $props();
 	const clerk = useClerkContext();
+	const client = useConvexClient();
 	const viewerSession = useViewerSession();
 	const verification = createClerkSessionVerification({
 		isCurrent: (session) =>
@@ -217,6 +220,7 @@
 		deleteErrorText = null;
 		deleting = true;
 		try {
+			await client.query(api.accountDeletion.authorize, {});
 			if (!isCurrent(a)) return;
 			await a.user.delete();
 			viewerSession.completeAccountDeletion({ sessionId: a.sessionId, userId: a.userId });
@@ -317,7 +321,7 @@
 		{/if}
 
 		{#if errorText}
-			<p class="text-[0.72rem] leading-5 text-red-700">{errorText}</p>
+			<p class="text-[0.72rem] leading-5 text-danger">{errorText}</p>
 		{/if}
 	</div>
 

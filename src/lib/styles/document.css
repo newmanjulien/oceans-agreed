@@ -1,7 +1,7 @@
 :root {
-	--document-highlight-trigger: rgba(34, 197, 94, 0.16);
-	--document-highlight-trigger-hover: rgba(34, 197, 94, 0.22);
-	--document-highlight-trigger-selected: rgba(34, 197, 94, 0.28);
+	--document-highlight-trigger: color-mix(in srgb, var(--color-success) 16%, transparent);
+	--document-highlight-trigger-hover: color-mix(in srgb, var(--color-success) 22%, transparent);
+	--document-highlight-trigger-selected: color-mix(in srgb, var(--color-success) 28%, transparent);
 	--document-highlight-revision-added: #dcf1b9;
 	--document-highlight-revision-removed: #e5e7eb;
 	--document-highlight-selection: #d2e3fc;

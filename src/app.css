@@ -21,9 +21,11 @@
 
 	--color-accent: #2563eb;
 	--color-accent-hover: #1d4ed8;
-	--color-danger: #b42318;
-	--color-danger-surface: #fff1f0;
-	--color-danger-surface-hover: #ffe4e1;
+	--color-success: #078647;
+	--color-danger: #d92525;
+	--color-danger-hover: #bc2020;
+	--color-danger-surface: #fff5f5;
+	--color-danger-surface-hover: #fff1f1;
 
 	--radius-base: 14px;
 	--radius-button-sm: 4px;

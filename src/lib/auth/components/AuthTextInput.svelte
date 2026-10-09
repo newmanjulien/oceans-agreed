@@ -12,6 +12,8 @@
 		autocomplete?: HTMLInputAttributes['autocomplete'];
 		inputmode?: HTMLInputAttributes['inputmode'];
 		required?: boolean;
+		disabled?: boolean;
+		maxlength?: number;
 		autofocus?: boolean;
 		invalid?: boolean;
 	};
@@ -24,6 +26,8 @@
 		autocomplete,
 		inputmode,
 		required = false,
+		disabled = false,
+		maxlength,
 		autofocus = false,
 		invalid = false
 	}: Props = $props();
@@ -52,6 +56,8 @@
 		{autocomplete}
 		{inputmode}
 		{required}
+		{disabled}
+		{maxlength}
 		aria-invalid={invalid}
 		class={cn(
 			fieldClass,

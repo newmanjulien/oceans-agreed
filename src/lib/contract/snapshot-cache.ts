@@ -9,7 +9,7 @@ import {
 	SNAPSHOT_BYTES
 } from './snapshot-storage';
 import type { SnapshotEntry, SnapshotSize } from './snapshot-storage';
-import { forgetOpening } from './browser-storage';
+import { forgetOpening, CACHE_MEMBERSHIP_ID, setCacheIdentity } from './browser-storage';
 import { ReadAttempt, waitForRead } from '$lib/auth/attempt';
 import type { ContractRouteData, ContractState } from './saved';
 
@@ -20,11 +20,16 @@ const MAX_ENTRIES = SNAPSHOT_ENTRIES;
 const MAX_BYTES = SNAPSHOT_BYTES;
 const BACKGROUND_CONCURRENCY = 2;
 
-/** Browser-only, layout-scoped snapshots. Mutable contract state is refreshed on every open. */
+/** Browser-only, membership-scoped snapshots. Mutable state is refreshed on every open. */
 class ContractSnapshotCache {
+	private readonly membershipId = CACHE_MEMBERSHIP_ID;
 	private disk = new SnapshotStorage();
 	private deleted = new Set<string>();
 	private entries = new Map<string, Entry>();
+	private versions = new Map<
+		string,
+		{ snapshot: ReadyContract['snapshot']; bytes: number; references: number }
+	>();
 	private flights = new Map<string, Flight>();
 	private queued = new Set<string>();
 	private bytes = 0;
@@ -75,8 +80,9 @@ class ContractSnapshotCache {
 		this.queued.delete(id);
 		const entry = this.remember(id, data);
 		if (entry) this.disk.put(entry, () => !this.deleted.has(id) && !this.lifetime.signal.aborted);
-		for (const listener of this.listeners) listener(data);
-		return data;
+		const confirmed = entry?.data ?? data;
+		for (const listener of this.listeners) listener(confirmed);
+		return confirmed;
 	}
 
 	allowBackground() {
@@ -122,10 +128,20 @@ class ContractSnapshotCache {
 				lastOperationId: entry.contract.lastOperationId ?? null
 			});
 	}
-	private evict(id: string) {
+	private forgetEntry(id: string) {
 		const entry = this.entries.get(id);
-		if (entry) this.bytes -= entry.bytes;
+		if (!entry) return;
+		this.bytes -= entry.bytes - entry.immutableBytes;
+		const versionId = entry.data.contract.templateVersionId;
+		const version = this.versions.get(versionId)!;
+		if (--version.references === 0) {
+			this.bytes -= version.bytes;
+			this.versions.delete(versionId);
+		}
 		this.entries.delete(id);
+	}
+	private evict(id: string) {
+		this.forgetEntry(id);
 		this.queued.delete(id);
 		this.cancelFlight(id);
 	}
@@ -147,17 +163,24 @@ class ContractSnapshotCache {
 	}
 
 	private remember(id: string, data: ReadyContract, size?: SnapshotSize) {
-		// Serialize immutable snapshot data once; subsequent state updates size only metadata.
+		const versionId = data.contract.templateVersionId;
+		const shared = this.versions.get(versionId);
 		const contractJson = JSON.stringify(data.contract);
-		const immutableBytes = size?.immutableBytes ?? JSON.stringify(data.snapshot).length * 2;
+		const immutableBytes =
+			shared?.bytes ?? size?.immutableBytes ?? JSON.stringify(data.snapshot).length * 2;
 		const bytes = immutableBytes + contractJson.length * 2;
-		const previous = this.entries.get(id);
-		if (previous) this.bytes -= previous.bytes;
-		this.entries.delete(id);
+		this.forgetEntry(id);
 		if (bytes > MAX_BYTES) return;
+		const version = shared ?? { snapshot: data.snapshot, bytes: immutableBytes, references: 0 };
+		if (!this.versions.has(versionId)) {
+			this.versions.set(versionId, version);
+			this.bytes += immutableBytes;
+		}
+		version.references++;
+		if (data.snapshot !== version.snapshot) data = { ...data, snapshot: version.snapshot };
 		const entry = { data, bytes, immutableBytes, contractJson };
 		this.entries.set(id, entry);
-		this.bytes += bytes;
+		this.bytes += contractJson.length * 2;
 		this.enforceLimits();
 		return entry;
 	}
@@ -169,7 +192,12 @@ class ContractSnapshotCache {
 		const previous = entry.data.contract;
 		const revision = previous.revision ?? 0;
 		if (state.revision < revision) return entry.data;
-		const contract = { ...previous, ...state, lastOperationId: state.lastOperationId ?? undefined };
+		const { reviews: _reviews, ...contentState } = state;
+		const contract = {
+			...previous,
+			...contentState,
+			lastOperationId: state.lastOperationId ?? undefined
+		};
 		const contractJson = JSON.stringify(contract);
 		if (contractJson === entry.contractJson) return entry.data;
 		const contractBytes = contractJson.length * 2;
@@ -233,8 +261,10 @@ class ContractSnapshotCache {
 			signal.throwIfAborted();
 			if (this.deleted.has(id)) return { id, status: 'missing' } as const;
 			recordColdStart(persisted ? 'contract-disk-cache-hit' : 'contract-snapshot-fetch-start');
+			if (!this.membershipId) throw new Error('Company access is required.');
 			const result =
-				persisted?.data ?? (await waitForRead(readContract(request, id, signal), signal));
+				persisted?.data ??
+				(await waitForRead(readContract(request, id, this.membershipId, signal), signal));
 			signal.throwIfAborted();
 			if (!persisted && result.status === 'ready' && !validSnapshot(result, id))
 				throw new Error('Invalid snapshot');
@@ -252,7 +282,7 @@ class ContractSnapshotCache {
 				for (const listener of this.listeners) listener(this.entries.get(id)?.data ?? result);
 			}
 			if (result.status === 'error') for (const listener of this.failures) listener(id);
-			return result;
+			return result.status === 'ready' ? (this.peek(id) ?? result) : result;
 		});
 		flight.result = waitForRead(work, signal)
 			.catch(() => {
@@ -318,6 +348,7 @@ class ContractSnapshotCache {
 		this.disk.close();
 		this.flights.clear();
 		this.entries.clear();
+		this.versions.clear();
 		this.queued.clear();
 		this.bytes = 0;
 	}
@@ -337,3 +368,12 @@ export function releaseContractSnapshotCache() {
 	cache?.destroy();
 	cache = undefined;
 }
+
+/** Registered once with the root session; it survives entry/workspace navigation. */
+export const contractCacheResources = {
+	cancelReads: cancelPendingContractSnapshots,
+	clear: () => {
+		releaseContractSnapshotCache();
+		setCacheIdentity(null);
+	}
+};

@@ -1,8 +1,7 @@
 import { paginationOptsValidator, paginationResultValidator } from 'convex/server';
 import { v, ConvexError } from 'convex/values';
-import { query, mutation, internalMutation } from './_generated/server';
-import { internal } from './_generated/api';
-import { requireProfile, verifiedIdentity } from './auth';
+import { query, mutation } from './_generated/server';
+import { requireMembership, verifiedIdentity, liveProfile } from './auth';
 import { permissions, permissionsForRole, role } from './permissions';
 export const profileView = v.object({
 	id: v.id('profiles'),
@@ -14,14 +13,30 @@ export const profileView = v.object({
 export const viewer = query({
 	args: {},
 	returns: v.union(
+		v.null(),
 		v.object({
 			profile: profileView,
 			permissions,
-			company: v.object({ name: v.string(), avatarUrl: v.union(v.string(), v.null()) }),
-			ready: v.boolean(),
-			needsInitialization: v.boolean()
-		}),
-		v.null()
+			membership: v.union(
+				v.null(),
+				v.object({
+					id: v.id('memberships'),
+					companyId: v.id('company'),
+					isOwner: v.boolean()
+				})
+			),
+			company: v.union(
+				v.null(),
+				v.object({
+					id: v.id('company'),
+					name: v.string(),
+					avatarUrl: v.union(v.string(), v.null()),
+					approvalEmail: v.union(v.string(), v.null())
+				})
+			),
+			needsInitialization: v.boolean(),
+			templateReady: v.boolean()
+		})
 	),
 	handler: async (ctx) => {
 		const identity = await verifiedIdentity(ctx);
@@ -37,14 +52,18 @@ export const viewer = query({
 			.withIndex('by_identity', (q) => q.eq('identity', identity.tokenIdentifier))
 			.unique();
 		if (!profile) return null;
-		const company = await ctx.db
-			.query('company')
-			.withIndex('by_key', (q) => q.eq('key', 'shared'))
+		const membership = await ctx.db
+			.query('memberships')
+			.withIndex('by_profileId', (q) => q.eq('profileId', profile._id))
 			.unique();
-		const workspace = await ctx.db
-			.query('workspace')
-			.withIndex('by_key', (q) => q.eq('key', 'shared'))
-			.unique();
+		const company = membership ? await ctx.db.get('company', membership.companyId) : null;
+		const pointer = company
+			? await ctx.db
+					.query('currentTemplate')
+					.withIndex('by_companyId', (q) => q.eq('companyId', company._id))
+					.unique()
+			: null;
+		const isOwner = company?.ownerProfileId === profile._id;
 		return {
 			profile: {
 				id: profile._id,
@@ -53,34 +72,20 @@ export const viewer = query({
 				role: profile.role,
 				avatarUrl: profile.avatarId ? await ctx.storage.getUrl(profile.avatarId) : null
 			},
-			company: {
-				name: company?.name ?? 'Oceans',
-				avatarUrl: company?.avatarId
-					? await ctx.storage.getUrl(company.avatarId)
-					: '/oceanstalent_logo.jpeg'
-			},
-			permissions: permissionsForRole(profile.role),
-			ready: workspace?.ready ?? false,
-			needsInitialization: !company || !workspace || profile.email !== identity.email
+			membership:
+				membership && company ? { id: membership._id, companyId: company._id, isOwner } : null,
+			company: company
+				? {
+						id: company._id,
+						name: company.name,
+						avatarUrl: company.avatarId ? await ctx.storage.getUrl(company.avatarId) : null,
+						approvalEmail: company.approvalEmail ?? null
+					}
+				: null,
+			permissions: permissionsForRole(membership && company ? profile.role : 'rep', isOwner),
+			needsInitialization: profile.email !== identity.email!.trim().toLowerCase(),
+			templateReady: Boolean(pointer?.versionId && !pointer.maintenance)
 		};
-	}
-});
-// Trusted operators assign roles through Convex's dashboard/CLI, never the public API.
-export const assignRole = internalMutation({
-	args: { profileId: v.id('profiles'), role },
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const profile = await ctx.db.get('profiles', args.profileId);
-		if (
-			!profile ||
-			(await ctx.db
-				.query('deletedUsers')
-				.withIndex('by_profileId', (q) => q.eq('profileId', args.profileId))
-				.unique())
-		)
-			throw new ConvexError('This account has been deleted.');
-		await ctx.db.patch('profiles', profile._id, { role: args.role });
-		return null;
 	}
 });
 export const initialize = mutation({
@@ -97,88 +102,52 @@ export const initialize = mutation({
 				.unique()
 		)
 			throw new ConvexError('This account has been deleted.');
-		let profile = await ctx.db
+		const profile = await ctx.db
 			.query('profiles')
 			.withIndex('by_identity', (q) => q.eq('identity', identity.tokenIdentifier))
 			.unique();
-		if (!profile) {
-			const id = await ctx.db.insert('profiles', {
+		const email = identity.email!.trim().toLowerCase();
+		if (profile) await ctx.db.patch('profiles', profile._id, { email });
+		else
+			await ctx.db.insert('profiles', {
 				identity: identity.tokenIdentifier,
 				issuer: identity.issuer,
 				clerkId: identity.subject,
-				email: identity.email!,
+				email,
 				name: (identity.name ?? '').trim().slice(0, 32),
 				role: 'rep'
 			});
-			profile = (await ctx.db.get('profiles', id))!;
-		} else if (profile.email !== identity.email)
-			await ctx.db.patch('profiles', profile._id, { email: identity.email! });
-		if (
-			!(await ctx.db
-				.query('company')
-				.withIndex('by_key', (q) => q.eq('key', 'shared'))
-				.unique())
-		)
-			await ctx.db.insert('company', { key: 'shared', name: 'Oceans' });
-		if (
-			!(await ctx.db
-				.query('workspace')
-				.withIndex('by_key', (q) => q.eq('key', 'shared'))
-				.unique())
-		) {
-			await ctx.db.insert('workspace', { key: 'shared', legacyOwnerId: profile._id, ready: false });
-			await ctx.scheduler.runAfter(0, internal.profiles.attributeLegacy, {});
-		}
-		return null;
-	}
-});
-export const attributeLegacy = internalMutation({
-	args: {},
-	returns: v.null(),
-	handler: async (ctx) => {
-		const workspace = await ctx.db
-			.query('workspace')
-			.withIndex('by_key', (q) => q.eq('key', 'shared'))
-			.unique();
-		if (!workspace || workspace.ready) return null;
-		const contracts = await ctx.db
-			.query('savedContracts')
-			.withIndex('by_creatorId', (q) => q.eq('creatorId', undefined))
-			.take(4);
-		for (const contract of contracts)
-			await ctx.db.patch('savedContracts', contract._id, { creatorId: workspace.legacyOwnerId });
-		if (contracts.length === 4)
-			await ctx.scheduler.runAfter(0, internal.profiles.attributeLegacy, {});
-		else {
-			await ctx.db.patch('workspace', workspace._id, { ready: true });
-			await ctx.scheduler.runAfter(0, internal.accountDeletion.resume, {});
-		}
 		return null;
 	}
 });
 export const colleagues = query({
-	args: { paginationOpts: paginationOptsValidator },
-	returns: paginationResultValidator(profileView),
-	handler: async (ctx, { paginationOpts }) => {
-		await requireProfile(ctx);
-		const page = await ctx.db.query('profiles').paginate(paginationOpts);
-		const profiles = [];
-		for (const profile of page.page) {
-			if (
-				await ctx.db
-					.query('deletedUsers')
-					.withIndex('by_profileId', (q) => q.eq('profileId', profile._id))
-					.unique()
-			)
-				continue;
-			profiles.push({
-				id: profile._id,
-				name: profile.name,
-				email: profile.email,
-				role: profile.role,
-				avatarUrl: profile.avatarId ? await ctx.storage.getUrl(profile.avatarId) : null
-			});
-		}
-		return { ...page, page: profiles };
+	args: { membershipId: v.id('memberships'), paginationOpts: paginationOptsValidator },
+	returns: paginationResultValidator(
+		profileView.extend({ membershipId: v.id('memberships'), isOwner: v.boolean() })
+	),
+	handler: async (ctx, args) => {
+		const access = await requireMembership(ctx, args.membershipId);
+		const result = await ctx.db
+			.query('memberships')
+			.withIndex('by_companyId', (q) => q.eq('companyId', access.companyId))
+			.paginate(args.paginationOpts);
+		const hydrated = await Promise.all(
+			result.page.map(async (member) => {
+				const profile = await liveProfile(ctx, member.profileId);
+				return profile
+					? {
+							id: profile._id,
+							name: profile.name,
+							email: profile.email,
+							role: profile.role,
+							avatarUrl: profile.avatarId ? await ctx.storage.getUrl(profile.avatarId) : null,
+							membershipId: member._id,
+							isOwner: access.company.ownerProfileId === profile._id
+						}
+					: null;
+			})
+		);
+		const page = hydrated.filter((profile) => profile !== null);
+		return { ...result, page };
 	}
 });

@@ -6,6 +6,7 @@ type HelpContent = {
 	steps: {
 		title: string;
 		description: string;
+		adminNote?: string;
 		highlight?: { text: string; color: 'blue' | 'green' };
 	}[];
 };
@@ -27,13 +28,15 @@ export const helpContent = {
 			},
 			{
 				title: 'Negotiate the clause',
-				description: 'Some clauses include information on how to negotiate the clause with buyers.'
+				description: 'Some clauses include information on how to negotiate the clause with buyers.',
+				adminNote: 'Concessions you apply are automatically approved because you’re an admin.'
 			}
 		]
 	},
 	admin: {
 		title: 'Add and edit',
-		intro: 'Help your reps understand and negotiate your contract by adding and editing instructions.',
+		intro:
+			'Help your reps understand and negotiate your contract by adding and editing instructions.',
 		steps: [
 			{
 				title: 'Select text',

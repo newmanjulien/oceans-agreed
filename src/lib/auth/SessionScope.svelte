@@ -7,13 +7,19 @@
 	import { useViewerSession } from './viewer-session.svelte';
 	import { ConvexSession } from './convex-session.svelte';
 	import { ReadAttempt, waitForRead } from './attempt';
+	import { useStartupPreparation } from './startup-preparation';
+	import { recordStartup } from './startup-perf';
 	import { onDestroy, setContext, untrack, type Snippet } from 'svelte';
 	let { children }: { children: Snippet } = $props();
 	const clerk = useClerkContext();
 	const owner = useViewerSession();
 	const sessionId = untrack(() => clerk.auth.sessionId ?? clerk.session?.id);
 	const transport = new ConvexSession(
-		new ConvexClient(env.PUBLIC_CONVEX_URL!, { disabled: !browser })
+		useStartupPreparation().take() ??
+			new ConvexClient(env.PUBLIC_CONVEX_URL!, {
+				disabled: !browser,
+				initialAuthTokenReuse: true
+			})
 	);
 	let authenticated = $state(false);
 	let loading = $state(true);
@@ -21,7 +27,8 @@
 	let attempt = 0;
 	let lifetime = new AbortController();
 	let authentication: ReadAttempt | undefined;
-	let generation = untrack(() => owner.transportGeneration);
+	const initialGeneration = untrack(() => owner.transportGeneration);
+	let generation = initialGeneration;
 	setConvexClientContext(transport.client);
 	setContext(_authContextKey, {
 		get isLoading() {
@@ -49,7 +56,12 @@
 			lifetime = new AbortController();
 			if (nextGeneration !== generation) {
 				void transport
-					.replace(new ConvexClient(env.PUBLIC_CONVEX_URL!, { disabled: !browser }))
+					.replace(
+						new ConvexClient(env.PUBLIC_CONVEX_URL!, {
+							disabled: !browser,
+							initialAuthTokenReuse: true
+						})
+					)
 					.catch((error) => console.error('Unable to close the previous Convex client.', error));
 				generation = nextGeneration;
 			}
@@ -79,7 +91,7 @@
 					if (current !== attempt || signal.aborted || clerk.session?.id !== sessionId) return null;
 					const tokenAttempt = new ReadAttempt(15_000);
 					try {
-						const skipCache = forceRefreshToken || generation > 1;
+						const skipCache = forceRefreshToken || generation !== initialGeneration;
 						const token = await waitForRead(
 							clerk.session!.getToken({ template: 'convex', skipCache }),
 							AbortSignal.any([signal, tokenAttempt.signal])
@@ -102,6 +114,7 @@
 				(accepted) => {
 					if (current !== attempt || signal.aborted || clerk.session?.id !== sessionId) return;
 					initial.complete();
+					if (accepted && loading) recordStartup('backend-authenticated');
 					authenticated = accepted;
 					loading = false;
 				}

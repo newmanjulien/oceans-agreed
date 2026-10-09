@@ -71,9 +71,10 @@ export function validSnapshot(value: unknown, id: string): value is ReadyContrac
 		typeof contract.companyName === 'string' &&
 		Number.isFinite(contract._creationTime) &&
 		Number.isFinite(contract.savedAt) &&
-		Number.isFinite(contract.blockCount) &&
-		Number.isFinite(contract.itemCount) &&
-		(contract.templateVersionId === undefined || typeof contract.templateVersionId === 'string') &&
+		Number.isSafeInteger(data.snapshot?.blockCount) &&
+		Number.isSafeInteger(data.snapshot?.itemCount) &&
+		typeof contract.templateVersionId === 'string' &&
+		typeof contract.companyId === 'string' &&
 		(contract.lastOperationId === undefined || typeof contract.lastOperationId === 'string') &&
 		(contract.revision === undefined || Number.isFinite(contract.revision)) &&
 		!!contract.selectedConcessions &&
@@ -83,8 +84,8 @@ export function validSnapshot(value: unknown, id: string): value is ReadyContrac
 		!!data.snapshot &&
 		Array.isArray(data.snapshot.blocks) &&
 		Array.isArray(data.snapshot.items) &&
-		contract.blockCount === data.snapshot.blocks.length &&
-		contract.itemCount === data.snapshot.items.length &&
+		data.snapshot.blockCount === data.snapshot.blocks.length &&
+		data.snapshot.itemCount === data.snapshot.items.length &&
 		data.snapshot.blocks.every((block) =>
 			matches(block, (baselineBlock as unknown as { json: Shape }).json)
 		) &&
@@ -92,6 +93,7 @@ export function validSnapshot(value: unknown, id: string): value is ReadyContrac
 			(item) =>
 				!!item &&
 				typeof item._id === 'string' &&
+				item.companyId === contract.companyId &&
 				Number.isFinite(item._creationTime) &&
 				matches(item, (playbookItem as unknown as { json: Shape }).json)
 		)
@@ -116,8 +118,7 @@ export class SnapshotStorage {
 	private database: Promise<IDBDatabase | undefined> | undefined;
 	private lifetime = new AbortController();
 	private pending = new Map<string, Write>();
-	private pendingBytes = 0;
-	private activeBytes = 0;
+	private active: Write | undefined;
 	private writing = false;
 	private open() {
 		if (this.closed) return Promise.resolve(undefined);
@@ -139,11 +140,12 @@ export class SnapshotStorage {
 			opening.signal.addEventListener('abort', failed, { once: true });
 			this.lifetime.signal.addEventListener('abort', failed, { once: true });
 			try {
-				const request = indexedDB.open(`${this.namespace}:snapshots`, 2);
+				const request = indexedDB.open(`${this.namespace}:snapshots`, 3);
 				request.onupgradeneeded = () => {
-					// The old combined format is an optional cache; rebuild it on demand.
-					if (request.result.objectStoreNames.contains('snapshots'))
-						request.result.deleteObjectStore('snapshots');
+					// Rebuild the optional cache with one immutable record per version.
+					for (const name of ['snapshots', 'metadata'])
+						if (request.result.objectStoreNames.contains(name))
+							request.result.deleteObjectStore(name);
 					request.result.createObjectStore('snapshots', { keyPath: 'id' });
 					request.result.createObjectStore('metadata', { keyPath: 'id' });
 				};
@@ -201,11 +203,17 @@ export class SnapshotStorage {
 			const [entry, metadata] = await this.transaction(
 				db,
 				'readonly',
-				(tx) =>
-					Promise.all([
-						result<StoredSnapshot | undefined>(tx.objectStore('snapshots').get(id)),
-						result<StoredMetadata | undefined>(tx.objectStore('metadata').get(id))
-					]),
+				async (tx) => {
+					const metadata = await result<StoredMetadata | undefined>(
+						tx.objectStore('metadata').get(id)
+					);
+					const entry = metadata
+						? await result<StoredSnapshot | undefined>(
+								tx.objectStore('snapshots').get(metadata.contract.templateVersionId)
+							)
+						: undefined;
+					return [entry, metadata] as const;
+				},
 				signal
 			);
 			if (signal?.aborted) return;
@@ -237,7 +245,6 @@ export class SnapshotStorage {
 	close() {
 		this.closed = true;
 		this.pending.clear();
-		this.pendingBytes = 0;
 		this.lifetime.abort();
 		void this.database?.then((db) => db?.close());
 	}
@@ -257,17 +264,14 @@ export class SnapshotStorage {
 				}
 			};
 		}
-		if (previous) this.pendingBytes -= writeBytes(previous);
 		this.pending.delete(id);
 		this.pending.set(id, write);
-		this.pendingBytes += writeBytes(write);
 		// Include the active payload: stalled storage must not retain an unbounded write backlog.
 		while (
-			this.pending.size > SNAPSHOT_ENTRIES ||
-			this.pendingBytes + this.activeBytes > SNAPSHOT_BYTES
+			this.pending.size &&
+			(this.pending.size > SNAPSHOT_ENTRIES || this.queuedBytes() > SNAPSHOT_BYTES)
 		) {
 			const oldest = this.pending.keys().next().value!;
-			this.pendingBytes -= writeBytes(this.pending.get(oldest)!);
 			this.pending.delete(oldest);
 		}
 		if (!this.writing) void this.drain();
@@ -279,37 +283,46 @@ export class SnapshotStorage {
 			const db = await this.open();
 			if (!db) {
 				this.pending.clear();
-				this.pendingBytes = 0;
 				return;
 			}
 			while (!this.closed && this.pending.size) {
 				const [id, write] = this.pending.entries().next().value!;
 				this.pending.delete(id);
-				this.activeBytes = writeBytes(write);
-				this.pendingBytes -= this.activeBytes;
+				this.active = write;
 				try {
 					if (write.valid())
 						await this.transaction(db, 'readwrite', (tx) => this.write(tx, id, write));
 				} catch {
 					/* Optional cache; failed writes do not affect confirmed server state. */
 				} finally {
-					this.activeBytes = 0;
+					this.active = undefined;
 				}
 			}
 		} finally {
 			this.writing = false;
 		}
 	}
+	private queuedBytes() {
+		const versions = new Map<string, number>();
+		let bytes = 0;
+		for (const write of [...this.pending.values(), ...(this.active ? [this.active] : [])]) {
+			bytes += writeBytes(write);
+			if (write.kind === 'put') {
+				bytes -= write.entry.immutableBytes;
+				versions.set(write.entry.data.contract.templateVersionId, write.entry.immutableBytes);
+			}
+		}
+		return bytes + [...versions.values()].reduce((sum, size) => sum + size, 0);
+	}
 	private async write(tx: IDBTransaction, id: string, write: Write) {
 		const store = tx.objectStore('metadata');
-		if (write.kind === 'delete') {
-			store.delete(id);
-			tx.objectStore('snapshots').delete(id);
-			return;
-		}
-		if (write.kind === 'put') {
+		const snapshots = tx.objectStore('snapshots');
+		if (write.kind === 'delete') store.delete(id);
+		else if (write.kind === 'put') {
 			const { data, bytes, immutableBytes } = write.entry;
-			tx.objectStore('snapshots').put({ id, snapshot: data.snapshot });
+			const versionId = data.contract.templateVersionId;
+			if ((await result(snapshots.getKey(versionId))) === undefined)
+				snapshots.put({ id: versionId, snapshot: data.snapshot });
 			store.put({ id, contract: data.contract, bytes, immutableBytes, usedAt: Date.now() });
 		} else {
 			const metadata = await result<StoredMetadata | undefined>(store.get(id));
@@ -330,15 +343,35 @@ export class SnapshotStorage {
 	private async enforceLimits(tx: IDBTransaction) {
 		const store = tx.objectStore('metadata');
 		const entries = await result<StoredMetadata[]>(store.getAll());
-		let total = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+		const versions = new Map<string, { bytes: number; references: number }>();
+		let total = 0;
+		for (const entry of entries) {
+			total += entry.bytes - entry.immutableBytes;
+			const id = entry.contract.templateVersionId;
+			const version = versions.get(id);
+			if (version) version.references++;
+			else {
+				versions.set(id, { bytes: entry.immutableBytes, references: 1 });
+				total += entry.immutableBytes;
+			}
+		}
 		let count = entries.length;
 		for (const entry of entries.sort((a, b) => a.usedAt - b.usedAt)) {
 			if (count <= SNAPSHOT_ENTRIES && total <= SNAPSHOT_BYTES) break;
 			store.delete(entry.id);
-			tx.objectStore('snapshots').delete(entry.id);
-			total -= entry.bytes;
+			total -= entry.bytes - entry.immutableBytes;
+			const versionId = entry.contract.templateVersionId;
+			const version = versions.get(versionId)!;
+			if (--version.references === 0) {
+				total -= version.bytes;
+				versions.delete(versionId);
+			}
 			count--;
 		}
+		// Remove orphaned versions after deletion, replacement or LRU eviction.
+		const snapshots = tx.objectStore('snapshots');
+		for (const id of await result(snapshots.getAllKeys()))
+			if (!versions.has(String(id))) snapshots.delete(id);
 	}
 	put(entry: SnapshotEntry, valid: () => boolean) {
 		const { data, bytes, immutableBytes } = entry;

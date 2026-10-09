@@ -1,16 +1,15 @@
 <script lang="ts">
-	import type DocumentHostType from './DocumentHost.svelte';
+	import LoadingWheel from '$lib/ui/LoadingWheel.svelte';
+	import AppHeader from '$lib/components/chrome/AppHeader.svelte';
 	import { page } from '$app/state';
-	import { useViewerSession } from './viewer-session.svelte';
+	import { useViewer, useViewerSession } from './viewer-session.svelte';
 	import { DocumentResources, setDocumentResources } from '$lib/document/runtime/resources.svelte';
 	import { env } from '$env/dynamic/public';
-	import { ReadAttempt, waitForRead } from './attempt';
+	import { loadComponent } from './component-loader.svelte';
+	import { recordStartup } from './startup-perf';
 	import { browser } from '$app/environment';
 	import { beforeNavigate, afterNavigate, onNavigate } from '$app/navigation';
-	import {
-		getContractSnapshotCache,
-		releaseContractSnapshotCache
-	} from '$lib/contract/snapshot-cache';
+	import { getContractSnapshotCache } from '$lib/contract/snapshot-cache';
 	import {
 		recordDocumentNavigation,
 		cancelDocumentNavigation
@@ -24,8 +23,10 @@
 	let { children }: { children: Snippet } = $props();
 	const interactions = setInteractionController(new InteractionController());
 	const session = useViewerSession();
+	const viewer = useViewer();
+	const cache = getContractSnapshotCache();
 	onMount(() => interactions.mount());
-	onMount(() => releaseContractSnapshotCache);
+
 	beforeNavigate((navigation) => {
 		if (navigation.to) recordDocumentNavigation(navigation.to.url.pathname);
 	});
@@ -45,56 +46,34 @@
 		layoutProfiles && env.PUBLIC_CONTRACT_DOCUMENT_PREPARATION !== '0'
 			? setDocumentResources(new DocumentResources(layoutProfiles))
 			: undefined;
-	let DocumentHost = $state<typeof DocumentHostType>();
-	let hostAttempt: ReadAttempt | undefined;
-	let hostGeneration = -1;
-	let alive = true;
-	let hostError = $state('');
+	const templatePending = $derived(
+		!viewer().templateReady && ['/admin', '/contracts/new'].includes(page.url.pathname)
+	);
 	const documentRoute = $derived(/^\/(admin|contracts)(\/|$)/.test(page.url.pathname));
+	const needsDocumentHost = $derived(documentRoute && !templatePending);
+	const host = loadComponent(
+		() => import('./DocumentHost.svelte'),
+		() => needsDocumentHost || Boolean(resources?.preparationCandidates.length),
+		() => session.transportGeneration,
+		(module) => {
+			if (resources) resources.createWorkspace = module.createContractWorkspace;
+		}
+	);
+	const DocumentHost = $derived(host.component);
+	const hostError = $derived(host.failed ? 'Unable to load the document viewer. Try again.' : '');
 	$effect(() => {
-		const ready = !documentRoute || Boolean(DocumentHost);
-		const failure = documentRoute ? hostError : '';
-		if (page.url.pathname !== '/' && !session.admitted)
-			untrack(() => session.reportDestination(ready, failure));
-	});
-	$effect(() => {
-		const needed = documentRoute || Boolean(resources?.preparationCandidates.length);
-		// Recovery retries a failed chunk load as well as the authenticated transport.
-		const generation = session.transportGeneration;
-		if (!needed) return;
-		untrack(() => {
-			if (DocumentHost || (hostAttempt && hostGeneration === generation)) return;
-			hostAttempt?.abort();
-			const attempt = new ReadAttempt(15_000);
-			hostAttempt = attempt;
-			hostGeneration = generation;
-			hostError = '';
-			void waitForRead(import('./DocumentHost.svelte'), attempt.signal)
-				.then((module) => {
-					if (!alive || hostAttempt !== attempt || session.transportGeneration !== generation)
-						return;
-					if (resources) resources.createWorkspace = module.createContractWorkspace;
-					DocumentHost = module.default;
-				})
-				.catch(() => {
-					if (alive && hostAttempt === attempt && session.transportGeneration === generation)
-						hostError = 'Unable to load the document viewer. Try again or reload.';
-				})
-				.finally(() => {
-					attempt.complete();
-					if (hostAttempt === attempt) hostAttempt = undefined;
-				});
-		});
+		if (page.url.pathname !== '/' && (!needsDocumentHost || DocumentHost))
+			untrack(() => recordStartup('usable'));
 	});
 	onNavigate(({ to }) => {
 		const path = to?.url.pathname;
 		const id = path === '/admin' ? 'admin' : path?.match(/^\/contracts\/([^/]+)\/?$/)?.[1];
-		if (id && id !== 'admin' && id !== 'new') void getContractSnapshotCache().load(id);
+		if (id && id !== 'admin' && id !== 'new') void cache.load(id);
 		return id ? resources?.beginOpen(id) : undefined;
 	});
 	onMount(() =>
 		resources
-			? getContractSnapshotCache().subscribe(
+			? cache.subscribe(
 					(data) => resources.prepare(data),
 					(id) => resources.remove(id),
 					(id) => resources.failedPreparation(id)
@@ -102,15 +81,27 @@
 			: undefined
 	);
 	onDestroy(() => {
-		alive = false;
-		hostAttempt?.abort();
+		cache.cancelPending();
 		resources?.destroy();
 		layoutProfiles?.scheduler.destroy();
 	});
 </script>
 
-{#if !documentRoute || DocumentHost}{@render children()}{/if}
-{#if documentRoute && hostError}<p role="alert" class="p-4 text-sm">
-		{hostError} <button class="underline" onclick={() => location.reload()}>Reload</button>
+{#if templatePending}
+	<AppHeader />
+	<main class="mx-auto max-w-xl px-6 py-16">
+		<h1 class="text-xl font-medium">Your company’s contract template is being prepared</h1>
+		<p class="mt-3 text-sm leading-6 text-ink-muted">
+			You can invite colleagues and set up your company while your baseline contract and playbook
+			are prepared. Contract creation will become available here when they’re ready.
+		</p>
+		<a href="/team" class="mt-6 inline-block text-sm underline">Go to company team</a>
+	</main>
+{:else if !documentRoute || DocumentHost}{@render children()}
+{:else if !hostError}<div class="flex justify-center py-16">
+		<LoadingWheel label="Loading document viewer" />
+	</div>{/if}
+{#if needsDocumentHost && hostError}<p role="alert" class="p-4 text-sm">
+		{hostError} <button class="underline" onclick={host.retry}>Try again</button>
 	</p>{/if}
 {#if DocumentHost}<DocumentHost profiles={layoutProfiles} {resources} />{/if}

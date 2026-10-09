@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick, untrack } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { goto, preloadCode } from '$app/navigation';
 	import { AccountNavigation } from './account-navigation';
 	import { useClerkReadiness } from './clerk-readiness';
 	import { beginStartupAttempt, recordStartup } from './startup-perf';
@@ -9,29 +9,42 @@
 	import { localReturn } from './navigation';
 	import { useSignIn, useSignUp } from 'svelte-clerk';
 	import AuthCodeStep from '$lib/auth/components/AuthCodeStep.svelte';
-	import AuthEntryShell from '$lib/auth/components/AuthEntryShell.svelte';
+	import { useEntryPresentation } from './entry-presentation.svelte';
 	import AuthHotkeyButton from '$lib/auth/components/AuthHotkeyButton.svelte';
 	import AuthStepFrame from '$lib/auth/components/AuthStepFrame.svelte';
 	import AuthTextInput from '$lib/auth/components/AuthTextInput.svelte';
 	import { createClerkEmailCodeAuthController, getClerkErrorCode } from '$lib/auth/email-code-auth';
+	import { useStartupPreparation } from './startup-preparation';
+	import { preloadDestination } from './destination-code';
+	import LoadingWheel from '$lib/ui/LoadingWheel.svelte';
 
 	type LoginStep = 'login' | 'code';
 
-	let { joining = false }: { joining?: boolean } = $props();
+	let {
+		joining = false,
+		invitation
+	}: { joining?: boolean; invitation?: { email: string; companyName: string } } = $props();
+	const presentation = useEntryPresentation();
 	const clerk = useClerkContext();
 	const readiness = useClerkReadiness();
+	const preparation = useStartupPreparation();
 	const navigation = new AccountNavigation(async (destination) => {
 		recordStartup('navigation-started');
 		await goto(destination, { invalidateAll: true });
 		if (page.url.pathname === '/login' || page.url.pathname === '/join')
 			throw new Error('Navigation returned to sign-in.');
+		recordStartup('navigation-completed');
 	});
 	let opening = $state(false);
 	let hydrated = $state(false);
 	let lifetime = new AbortController();
 	let observedSession: string | undefined;
 	let navigatingSession: string | undefined;
-	const returnTo = $derived(localReturn(page.url.searchParams.get('returnTo')));
+	const returnTo = $derived(
+		invitation
+			? page.url.pathname + page.url.search
+			: localReturn(page.url.searchParams.get('returnTo'))
+	);
 	const invitationTicket = $derived(page.url.searchParams.get('__clerk_ticket'));
 	$effect(() => {
 		const id = clerk.session?.id;
@@ -39,23 +52,27 @@
 		untrack(() => {
 			if (id === observedSession) return;
 			observedSession = id;
-			if (id) void openWorkspace(id, destination);
+			if (id && !invitation) void openDestination(id, destination);
+			else if (id) recordStartup('auth-accepted');
 			else showEmailStep();
 		});
 	});
-	async function openWorkspace(id: string, destination: string) {
+	async function openDestination(id: string, destination: string) {
 		if (opening && navigatingSession === id) return;
+		const verifying = isSubmittingCode || isSubmittingEmail;
 		cancelPending();
 		const current = generation;
 		navigatingSession = id;
 		opening = true;
 		authErrorText = null;
-		beginStartupAttempt();
+		if (!verifying) beginStartupAttempt();
 		recordStartup('auth-accepted');
+		// Clerk owns the token cache; the destination requests this same session's token.
+		void clerk.session?.getToken({ template: 'convex' }).catch(() => {});
 		try {
 			await navigation.open(id, destination);
 		} catch {
-			if (current === generation) authErrorText = 'We couldn’t open your workspace. Try again.';
+			if (current === generation) authErrorText = 'We couldn’t open this page. Try again.';
 		} finally {
 			if (current === generation) {
 				opening = false;
@@ -81,11 +98,16 @@
 	async function acceptTicket(ticket: string) {
 		const current = ++generation;
 		isSubmittingEmail = true;
+		beginStartupAttempt();
 		try {
 			if (!(await waitForAuth(current))) return;
+			prepareDestination();
 			await authController.acceptTicket(ticket);
 		} catch (error) {
-			if (current === generation) authErrorText = authController.getErrorMessage(error);
+			if (current === generation) {
+				preparation.cancel();
+				authErrorText = authController.getErrorMessage(error);
+			}
 		} finally {
 			if (current === generation) isSubmittingEmail = false;
 		}
@@ -118,10 +140,11 @@
 	onDestroy(() => {
 		cancelPending();
 		lifetime.abort();
+		if (!clerk.session) preparation.cancel();
 	});
 
 	let step = $state<LoginStep>('login');
-	let email = $state('');
+	let email = $state(untrack(() => invitation?.email ?? ''));
 	let verificationCode = $state('');
 	let authErrorText = $state<string | null>(null);
 	let isSubmittingEmail = $state(false);
@@ -131,7 +154,6 @@
 	const joinHref = $derived(
 		(joining ? '/login' : '/join') + '?returnTo=' + encodeURIComponent(returnTo)
 	);
-	const currentReturnButtonHref = undefined;
 	const canContinue = $derived(
 		hydrated && email.trim().length > 0 && !isSubmittingEmail && !opening
 	);
@@ -139,7 +161,11 @@
 		await readiness.ready({ signal: lifetime.signal });
 		await tick();
 		if (current !== generation || opening || clerk.session) return false;
-		if (!(joining ? signUpState.signUp : signInState.signIn))
+		if (
+			invitation
+				? !signInState.signIn || !signUpState.signUp
+				: !(joining ? signUpState.signUp : signInState.signIn)
+		)
 			throw new Error('Sign-in is unavailable. Please try again.');
 		return true;
 	}
@@ -153,7 +179,7 @@
 	}
 
 	async function submitEmail() {
-		const normalizedEmail = email.trim().toLowerCase();
+		const normalizedEmail = (invitation?.email ?? email).trim().toLowerCase();
 		if (!normalizedEmail || isSubmittingEmail || opening || readiness.status === 'error') return;
 
 		const current = ++generation;
@@ -165,13 +191,16 @@
 			if (!(await waitForAuth(current))) return;
 			// An invitation is consumed by its own serialized operation.
 			if (joining && invitationTicket && !ticketStarted) return;
-			if (joining) await authController.sendJoinCode(normalizedEmail);
+			prepareDestination();
+			if (invitation) await authController.sendInvitationCode(normalizedEmail);
+			else if (joining) await authController.sendJoinCode(normalizedEmail);
 			else await authController.sendLoginCode(normalizedEmail);
 			if (current !== generation) return;
 			email = normalizedEmail;
 			step = 'code';
 		} catch (error) {
 			if (current !== generation) return;
+			preparation.cancel();
 			authErrorText =
 				getClerkErrorCode(error) === 'form_identifier_not_found'
 					? "Couldn't find your account."
@@ -188,6 +217,8 @@
 		const current = generation;
 		isSubmittingCode = true;
 		authErrorText = null;
+		beginStartupAttempt();
+		recordStartup('code-submitted');
 
 		try {
 			if (!(await waitForAuth(current))) return;
@@ -220,43 +251,77 @@
 
 	function showEmailStep() {
 		cancelPending();
+		preparation.cancel();
 		verificationCode = '';
 		authErrorText = null;
 		step = 'login';
 	}
+
+	$effect(() => {
+		presentation.footer = accountFooter;
+		presentation.showFooter = !invitation && step === 'login' && !opening;
+		return () => {
+			if (presentation.footer === accountFooter) {
+				presentation.footer = undefined;
+				presentation.showFooter = true;
+			}
+		};
+	});
+
+	function prepareDestination() {
+		preparation.warm();
+		const pathname = new URL(returnTo, page.url).pathname;
+		void Promise.all([preloadCode(pathname), preloadDestination(pathname)]).catch(() => {});
+	}
 </script>
 
-<AuthEntryShell
-	accent="link"
-	onReturnButtonClick={step === 'code' ? showEmailStep : undefined}
-	returnButtonHref={currentReturnButtonHref}
-	showFooter={step === 'login'}
->
-	{#snippet footer()}
-		<p class="m-0 text-[13px] leading-5 text-[#8f9297]">
-			{joining ? 'Already have an account?' : 'Need an account?'}
-			<a
-				href={joinHref}
-				class="text-stone-500 underline underline-offset-2 transition-colors hover:text-[#202124]"
-			>
-				{joining ? 'Log in' : 'Join'}
-			</a>
-		</p>
-	{/snippet}
+<svelte:head>
+	<title
+		>{step === 'code'
+			? 'Enter your code'
+			: invitation
+				? `Join ${invitation.companyName}`
+				: joining
+					? 'Join'
+					: 'Log in'} | Agreed</title
+	>
+</svelte:head>
 
-	{#if opening}
-		<p role="status" class="text-sm text-ink-muted">Opening your workspace…</p>
-	{:else if clerk.session}
-		<AuthStepFrame title="Open your workspace">
+{#snippet accountFooter()}
+	<p class="m-0 text-[13px] leading-5 text-[#8f9297]">
+		{joining ? 'Already have an account?' : 'Need an account?'}
+		<a
+			href={joinHref}
+			class="text-stone-500 underline underline-offset-2 transition-colors hover:text-[#202124]"
+		>
+			{joining ? 'Log in' : 'Join'}
+		</a>
+	</p>
+{/snippet}
+
+{#if opening}
+	<div class="flex justify-center py-8"><LoadingWheel label="Opening your account" /></div>
+{:else}
+	{#if clerk.session}
+		<AuthStepFrame title="Continue to Agreed">
 			{#if authErrorText}
-				<p role="alert" class="m-0 text-sm leading-5 text-[#ff3a1e]">{authErrorText}</p>
+				<p role="alert" class="m-0 text-sm leading-5 text-danger">{authErrorText}</p>
 			{/if}
-			<AuthHotkeyButton onclick={() => void openWorkspace(clerk.session!.id, returnTo)}>
+			<AuthHotkeyButton onclick={() => void openDestination(clerk.session!.id, returnTo)}>
 				Try again
 			</AuthHotkeyButton>
 		</AuthStepFrame>
 	{:else if step === 'login'}
-		<AuthStepFrame title={joining ? 'Join Agreed' : 'Log in to Agreed'}>
+		<AuthStepFrame
+			title={invitation
+				? `Join ${invitation.companyName}`
+				: joining
+					? 'Join Agreed'
+					: 'Log in to Agreed'}
+			description={invitation
+				? 'Verify your invited email to continue. We’ll create your Agreed account if you need one.'
+				: undefined}
+		>
 			<form
 				class="grid gap-3.5"
 				onsubmit={(event) => {
@@ -266,17 +331,21 @@
 					}
 				}}
 			>
-				<AuthTextInput
-					label="Your work email"
-					bind:value={email}
-					type="email"
-					autocomplete="email"
-					required
-					autofocus
-					invalid={Boolean(authErrorText)}
-				/>
+				{#if invitation}
+					<p class="m-0 text-center text-sm leading-5 break-words text-[#686b73]">
+						{invitation.email}
+					</p>
+				{:else}<AuthTextInput
+						label="Your work email"
+						bind:value={email}
+						type="email"
+						autocomplete="email"
+						required
+						autofocus
+						invalid={Boolean(authErrorText)}
+					/>{/if}
 				{#if readiness.error || authErrorText}
-					<p role="alert" class="m-0 text-sm leading-5 text-[#ff3a1e]">
+					<p role="alert" class="m-0 text-sm leading-5 text-danger">
 						{readiness.error || authErrorText}
 					</p>
 				{/if}
@@ -290,20 +359,25 @@
 						? readiness.status === 'ready'
 							? 'Sending…'
 							: 'Connecting…'
-						: 'Email me a code'}
+						: invitation
+							? 'Continue'
+							: 'Email me a code'}
 				</AuthHotkeyButton>
 			</form>
 		</AuthStepFrame>
 	{:else}
 		<AuthCodeStep
 			{email}
+			description={invitation ? `Verify your email to join ${invitation.companyName}.` : undefined}
 			bind:code={verificationCode}
 			errorText={authErrorText}
 			isSubmitting={isSubmittingCode}
 			isResending={isResendingCode}
 			onSubmit={() => void submitCode()}
 			onResend={() => void resendCode()}
-			onChangeEmail={showEmailStep}
+			onChangeEmail={invitation ? undefined : showEmailStep}
 		/>
 	{/if}
-</AuthEntryShell>
+{/if}
+
+{#if invitation}<div id="clerk-captcha"></div>{/if}

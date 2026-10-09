@@ -4,13 +4,11 @@
 	import { goto } from '$app/navigation';
 	import type { Id } from '../../../convex/_generated/dataModel';
 	import type { ContractRouteData } from '$lib/contract/saved';
-	import type { ReadyContract } from '$lib/document/runtime/resources.svelte';
 	import SavedContract from './SavedContract.svelte';
 	import NewContract from './NewContract.svelte';
 	let { data }: { data: ContractRouteData } = $props();
 	let creating = $state(untrack(() => data.status === 'new'));
 	let creationTarget = $state<string | null>(null);
-	let seed = $state.raw<ReadyContract>();
 	let attempt = $state(0);
 	let completion: ((success: boolean) => void) | undefined;
 	$effect(() => {
@@ -22,11 +20,13 @@
 		});
 	});
 	let active = true;
-	onDestroy(() => { active = false; completion?.(false); });
-	async function openSaved(id: Id<'savedContracts'>, confirmed: ReadyContract) {
+	onDestroy(() => {
+		active = false;
+		completion?.(false);
+	});
+	async function openSaved(id: Id<'savedContracts'>) {
 		if (!active) return false;
 		creationTarget = id;
-		seed = confirmed;
 		try {
 			if (data.id !== id)
 				await goto(`/contracts/${id}`, { replaceState: true, noScroll: true, keepFocus: true });
@@ -58,12 +58,7 @@
 
 {#if data.id && (!creating || (creationTarget && attempt > 0))}
 	{#key `${data.id}:${attempt}`}
-		<SavedContract
-			id={data.id}
-			seed={seed?.id === data.id ? seed : undefined}
-			onVisible={visible}
-			onFailure={failure}
-		/>
+		<SavedContract id={data.id} onVisible={visible} onFailure={failure} />
 	{/key}
 {/if}
 {#if creating}<NewContract onOpen={openSaved} showPreview={!creationTarget} />{/if}

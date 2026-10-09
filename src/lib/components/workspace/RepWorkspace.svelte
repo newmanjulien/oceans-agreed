@@ -2,7 +2,7 @@
 	import { documentAnnotations } from '$lib/playbook/document-overlay';
 	import { onDestroy, onMount, untrack } from 'svelte';
 	import { beforeNavigate, goto } from '$app/navigation';
-	import { navigating } from '$app/state';
+	import { navigating, page } from '$app/state';
 	import type { BeforeNavigate } from '@sveltejs/kit';
 	import { useAuth, useConvexClient, useQuery } from 'convex-svelte';
 	import { api } from '../../../convex/_generated/api';
@@ -10,7 +10,7 @@
 	import type { ContractSnapshot, ContractState } from '$lib/contract/saved';
 	import { ContractPersistence } from '$lib/contract/persistence.svelte';
 	import { DraftJournal } from '$lib/contract/draft-recovery.svelte';
-	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import { useViewer, useViewerSession } from '$lib/auth/viewer-session.svelte';
 	import { recordOpening } from '$lib/contract/browser-storage';
 	import { getContractSnapshotCache } from '$lib/contract/snapshot-cache';
 	import type { OperationStatus } from '$lib/components/chrome/operation-status';
@@ -28,7 +28,14 @@
 	import type { ConcessionSelection, ContractRenderSource } from '$lib/document/runtime/types';
 	import { composeExport } from '$lib/contract/export/content';
 	import { downloadWord, prepareWord, retireWordUrl } from '$lib/contract/export/word';
-	import { requiresApproval, matchesApprovalSelection } from '$lib/contract/approval';
+	import {
+		approvalCoversPending,
+		legacyLifecycle,
+		reviewStatus,
+		type ReviewTag,
+		type ReviewDecision,
+		type ReviewNavigation
+	} from '$lib/contract/approval';
 	import { saveError } from '$lib/contract/saved';
 	let {
 		snapshot,
@@ -73,11 +80,13 @@
 	const client = useConvexClient();
 	const auth = useAuth();
 	const session = useViewerSession();
+	const accountViewer = useViewer();
+	const membershipId = accountViewer().membership.id;
 	const contractId = untrack(() => initialContract._id);
-	const journal = untrack(() => new DraftJournal(session.userId!, contractId));
+	const journal = untrack(() => new DraftJournal(session.userId!, contractId, membershipId));
 	let mounted = $state(false);
 	const approvalQuery = useQuery(api.approvals.latest, () =>
-		mounted && auth.isAuthenticated ? { id: contractId } : 'skip'
+		mounted && auth.isAuthenticated ? { membershipId, id: contractId } : 'skip'
 	);
 	let requestingApproval = $state(false);
 	let approvalError = $state<string | null>(null);
@@ -90,11 +99,17 @@
 					companyName: initialContract.companyName,
 					selectedConcessions: initialContract.selectedConcessions,
 					revision: initialContract.revision ?? 0,
-					lastOperationId: initialContract.lastOperationId ?? null
+					lastOperationId: initialContract.lastOperationId ?? null,
+					reviews: initialContract.reviews ?? {}
 				},
-				(request) => client.mutation(api.savedContracts.saveChoices, request),
+				(request) => client.mutation(api.savedContracts.saveChoices, { ...request, membershipId }),
 				(draft) => journal.write(draft),
-				journal.read()
+				journal.read(),
+				new Set(
+					snapshot.items
+						.filter((i) => i.instructions?.changesNeedApproval?.trim())
+						.map((i) => i._id)
+				)
 			)
 	);
 	function resumeSaving() {
@@ -445,16 +460,178 @@
 		selectedItemId = null;
 		selectedAnnotationId = null;
 	}
-	const approvalCount = $derived(
-		snapshot.items.filter((item) => requiresApproval([item], persistence.choices)).length
+
+	const isAdmin = $derived(accountViewer().profile.role === 'admin');
+	type DecisionAttempt = {
+		operationId: string;
+		concessionId: string;
+		lifecycle: string;
+		status: ReviewDecision;
+	};
+	let deciding = $state(false);
+	let decisionError = $state.raw<{
+		itemId: string;
+		attempt: DecisionAttempt;
+		changesStatus: boolean;
+		message: string;
+	} | null>(null);
+	let reviewNavigation = $state.raw<ReviewNavigation>();
+	let reviewedLink = false;
+	let reviewLinkMessage = $state<string | null>(null);
+	const canReview = $derived(
+		isAdmin &&
+			editable &&
+			!persistence.pending &&
+			!persistence.error &&
+			connected &&
+			viewer.ready &&
+			!session.blocked
 	);
+	const reviewApplications = $derived.by(() => {
+		if (!source.renderSource?.sourceIndex) return [];
+		return snapshot.items.flatMap((item) => {
+			const selected = persistence.choices[item._id];
+			if (!selected || !item.instructions?.changesNeedApproval?.trim()) return [];
+			const concessionPosition = item.concessions.findIndex((c) => c.id === selected);
+			const concession = item.concessions[concessionPosition];
+			if (!concession) return [];
+			const range = concession.changes[0]?.range ?? item.triggers[0]?.range;
+			if (!range) return [];
+			return [
+				{
+					item,
+					concession,
+					concessionPosition,
+					range
+				}
+			];
+		});
+	});
+	const reviewTags = $derived.by<ReviewTag[]>(() =>
+		reviewApplications.map(({ item, concession, concessionPosition, range }) => {
+			const lifecycle = persistence.lifecycles[item._id];
+			const saved =
+				persistence.confirmed.selectedConcessions[item._id] === concession.id &&
+				(persistence.confirmed.reviews?.[item._id]?.lifecycle ??
+					legacyLifecycle(item._id, concession.id)) === lifecycle;
+			return {
+				itemId: item._id,
+				concessionId: concession.id,
+				concessionPosition,
+				lifecycle,
+				status:
+					!saved && isAdmin && persistence.pending
+						? 'approved'
+						: reviewStatus(persistence.confirmed, item._id, concession.id, lifecycle),
+				description: concession.description,
+				range,
+				admin: isAdmin,
+				disabled: !canReview || deciding
+			};
+		})
+	);
+	const approvalCount = $derived(reviewTags.filter((t) => t.status !== 'approved').length);
+	const pendingApprovalCount = $derived(reviewTags.filter((t) => t.status === 'pending').length);
 	const approvalNeeded = $derived(approvalCount > 0);
+	$effect(() => {
+		if (pendingApprovalCount) reviewLinkMessage = null;
+	});
+	$effect(() => {
+		if (
+			reviewedLink ||
+			page.url.searchParams.get('review') !== '1' ||
+			!stateReconciled ||
+			!viewer.ready ||
+			persistence.pending
+		)
+			return;
+		reviewedLink = true;
+		if (!pendingApprovalCount) reviewLinkMessage = 'There are no concessions waiting for review.';
+		untrack(() => {
+			reviewNavigation = {};
+		});
+	});
+	// Reuse an ambiguous operation only for the exact same decision and lifecycle.
+	const decisionAttempts = new Map<string, DecisionAttempt>();
+	function decisionSettled(itemId: string, attempt: DecisionAttempt, changesStatus = true) {
+		const confirmed = persistence.confirmed;
+		return (
+			confirmed.selectedConcessions[itemId as Id<'playbookItems'>] !== attempt.concessionId ||
+			(confirmed.reviews?.[itemId as Id<'playbookItems'>]?.lifecycle ??
+				legacyLifecycle(itemId, attempt.concessionId)) !== attempt.lifecycle ||
+			(changesStatus &&
+				reviewStatus(confirmed, itemId, attempt.concessionId, attempt.lifecycle) === attempt.status)
+		);
+	}
+	$effect(() => {
+		persistence.confirmed;
+		for (const [itemId, attempt] of decisionAttempts) {
+			if (decisionSettled(itemId, attempt)) decisionAttempts.delete(itemId);
+		}
+		if (
+			decisionError &&
+			decisionSettled(decisionError.itemId, decisionError.attempt, decisionError.changesStatus)
+		)
+			decisionError = null;
+	});
+	async function decideReview(tag: ReviewTag, status: ReviewDecision) {
+		const current = reviewTags.find(
+			(t) =>
+				t.itemId === tag.itemId &&
+				t.lifecycle === tag.lifecycle &&
+				t.concessionId === tag.concessionId
+		);
+		if (!active || !current || current.disabled) return;
+		const prior = decisionAttempts.get(tag.itemId);
+		const attempt =
+			prior?.concessionId === tag.concessionId &&
+			prior.lifecycle === tag.lifecycle &&
+			prior.status === status &&
+			reviewStatus(persistence.confirmed, tag.itemId, tag.concessionId, tag.lifecycle) !== status
+				? prior
+				: {
+						operationId: crypto.randomUUID(),
+						concessionId: tag.concessionId,
+						lifecycle: tag.lifecycle,
+						status
+					};
+		// A decision already visible in live state is a fresh acknowledgement,
+		// even when the server has no metadata change to publish for this click.
+		const changesStatus = current.status !== status;
+		if (changesStatus) decisionAttempts.set(tag.itemId, attempt);
+		else decisionAttempts.delete(tag.itemId);
+		deciding = true;
+		decisionError = null;
+		try {
+			await client.mutation(api.approvals.decide, {
+				membershipId,
+				id: contractId,
+				itemId: tag.itemId as Id<'playbookItems'>,
+				concessionId: tag.concessionId,
+				lifecycle: tag.lifecycle,
+				status,
+				operationId: attempt.operationId
+			});
+			if (!active) return;
+			decisionAttempts.delete(tag.itemId);
+			reviewNavigation = { afterItemId: tag.itemId };
+		} catch (error) {
+			if (active && !decisionSettled(tag.itemId, attempt, changesStatus))
+				decisionError = {
+					itemId: tag.itemId,
+					attempt,
+					changesStatus,
+					message: saveError(error, 'We couldn’t save this decision. Choose it again to retry.')
+				};
+		} finally {
+			if (active) deciding = false;
+		}
+	}
+
 	const matchingApproval = $derived(
 		latestApproval &&
-			latestApproval.companyName === persistence.confirmed.companyName &&
-			matchesApprovalSelection(
-				snapshot.items,
-				persistence.choices,
+			approvalCoversPending(
+				reviewTags.filter((t) => t.status === 'pending'),
 				latestApproval.selectedConcessions
 			)
 			? latestApproval
@@ -484,8 +661,7 @@
 	const preparingWord = $derived(wordAttempt !== null);
 	let preparedWord = $state.raw<{ input: WordInput; url: string } | null>(null);
 	const savedExportInput = $derived.by<WordInput | null>(() => {
-		if (approvalNeeded || persistence.pending || persistence.deleted || !source.renderSource)
-			return null;
+		if (persistence.pending || persistence.deleted || !source.renderSource) return null;
 		return {
 			source: source.renderSource,
 			concessions: Object.freeze({ ...persistence.confirmed.selectedConcessions }),
@@ -525,7 +701,7 @@
 	});
 	const exportSnapshot = $derived(preparingWord || approvalNeeded ? null : eligibleExportSnapshot);
 	const canRequestApproval = $derived(
-		approvalNeeded &&
+		pendingApprovalCount > 0 &&
 			Boolean(eligibleExportSnapshot) &&
 			approvalQuery.data !== undefined &&
 			!approvalQuery.error &&
@@ -539,6 +715,7 @@
 		approvalError = null;
 		try {
 			await client.mutation(api.approvals.request, {
+				membershipId,
 				id: contractId,
 				expectedRevision: persistence.confirmed.revision
 			});
@@ -569,7 +746,7 @@
 	}
 	$effect(() => {
 		const input = savedExportInput;
-		const rendered = approvalNeeded ? null : eligibleExportSnapshot;
+		const rendered = eligibleExportSnapshot;
 		untrack(() => {
 			if (!sameWordInput(wordInput, input)) {
 				invalidateWord();
@@ -637,7 +814,7 @@
 <BoxDismissal owner={interactionOwner} active={Boolean(item)} onDismiss={close} />
 
 <svelte:window onbeforeunload={warnBeforeUnload} />
-<WorkspaceChrome {feedback} />
+<WorkspaceChrome {feedback} {isAdmin} />
 {#if journal.memoryOnly && persistence.pending}<p
 		role="alert"
 		class="mx-auto mt-4 max-w-3xl rounded-md border border-line bg-surface p-3 text-sm"
@@ -666,6 +843,12 @@
 				>Leave and discard changes</button
 			>{/if}
 	</div>{/if}
+{#if reviewLinkMessage}<p
+		class="mx-auto mt-4 max-w-3xl text-center text-sm text-ink-muted"
+		role="status"
+	>
+		{reviewLinkMessage}
+	</p>{/if}
 {#if source.renderSource && !persistence.deleted}
 	<main
 		onclickcapture={recordContractInput}
@@ -727,15 +910,19 @@
 					</p>
 				{:else if !approvalSending && approvalRequested}
 					<p class="mt-3 text-center text-sm text-ink-muted/60" role="status">
-						Approval request sent to Ben.
+						Approval request sent.
 					</p>
 				{/if}
-				{#if approvalNeeded && !approvalRequested}
+				{#if approvalNeeded}
 					<p class="mt-3 text-center text-sm text-ink-muted">
 						{approvalCount === 1 ? 'This concession requires' : 'These concessions require'} approval
 						before download.
 					</p>
 				{/if}
+
+				{#if decisionError}<p class="mt-3 text-center text-sm text-ink-muted" role="alert">
+						{decisionError.message}
+					</p>{/if}
 				{#if preparingWord}
 					<p class="mt-3 text-center text-sm text-ink-muted" role="status">
 						Preparing Word download…
@@ -752,8 +939,12 @@
 			{panelContent}
 			{footerContent}
 			{selectedAnnotationId}
+			{reviewTags}
+			{reviewNavigation}
+			onReviewDecision={decideReview}
 			selectedConcessions={persistence.choices}
-			allowPlaybookNavigation={editable}
+			allowPlaybookNavigation
+			playbookNavigationReady={editable}
 			onRemoveConcession={(itemId) => {
 				if (editable) persistence.select(itemId as Id<'playbookItems'>, null);
 			}}

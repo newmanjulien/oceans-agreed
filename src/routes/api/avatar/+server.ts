@@ -13,6 +13,8 @@ export const POST: RequestHandler = async ({ locals, request, url }) => {
 		'/avatar',
 		env.PUBLIC_CONVEX_URL.replace('.convex.cloud', '.convex.site')
 	);
+	if (url.searchParams.has('membershipId'))
+		endpoint.searchParams.set('membershipId', url.searchParams.get('membershipId')!);
 	endpoint.searchParams.set('company', String(url.searchParams.get('company') === 'true'));
 	try {
 		const response = await fetch(endpoint, {

@@ -7,6 +7,7 @@
 		fragment,
 		profileMode = false,
 		interactive = true,
+		navigationCapable = false,
 		selectedAnnotationId,
 		canOpenPlaybookItems,
 		onAnnotationSelect
@@ -15,6 +16,7 @@
 		/** Preserve layout markup while suppressing global IDs and interactive semantics. */
 		profileMode?: boolean;
 		interactive?: boolean;
+		navigationCapable?: boolean;
 		selectedAnnotationId: string | null;
 		canOpenPlaybookItems: boolean;
 		onAnnotationSelect: (
@@ -37,6 +39,7 @@
 		<InlineContent
 			{profileMode}
 			{interactive}
+			{navigationCapable}
 			tokens={fragment.tokens}
 			{selectedAnnotationId}
 			canOpenPlaybookItems={canOpenPlaybookItems && interactive && !profileMode}
@@ -55,6 +58,7 @@
 		<InlineContent
 			{profileMode}
 			{interactive}
+			{navigationCapable}
 			tokens={fragment.tokens}
 			{selectedAnnotationId}
 			canOpenPlaybookItems={canOpenPlaybookItems && interactive && !profileMode}
@@ -82,6 +86,7 @@
 							<InlineContent
 								{profileMode}
 								{interactive}
+								{navigationCapable}
 								tokens={cell.tokens}
 								{selectedAnnotationId}
 								canOpenPlaybookItems={canOpenPlaybookItems && interactive && !profileMode}
@@ -102,6 +107,7 @@
 							<InlineContent
 								{profileMode}
 								{interactive}
+								{navigationCapable}
 								tokens={cell.tokens}
 								{selectedAnnotationId}
 								canOpenPlaybookItems={canOpenPlaybookItems && interactive && !profileMode}

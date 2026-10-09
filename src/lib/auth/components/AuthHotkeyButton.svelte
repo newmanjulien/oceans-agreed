@@ -6,19 +6,11 @@
 		children: Snippet;
 		disabled?: boolean;
 		hotkey?: 'Enter';
-		hotkeyLabel?: string;
 		onclick?: () => void;
 		type?: 'button' | 'submit';
 	};
 
-	let {
-		children,
-		disabled = false,
-		hotkey = 'Enter',
-		hotkeyLabel = 'return',
-		onclick,
-		type = 'button'
-	}: Props = $props();
+	let { children, disabled = false, hotkey = 'Enter', onclick, type = 'button' }: Props = $props();
 
 	function isEditableTarget(target: EventTarget | null) {
 		return (
@@ -42,12 +34,5 @@
 <svelte:window onkeydown={handleWindowKeydown} />
 
 <AuthButton {type} {disabled} {onclick} aria-keyshortcuts={hotkey}>
-	<span>{@render children()}</span>
-	<span class="absolute right-3 hidden sm:inline-flex">
-		<span
-			class="inline-flex h-5 min-w-5 items-center justify-center rounded-button-sm bg-current/10 px-2 text-xs"
-		>
-			{hotkeyLabel}
-		</span>
-	</span>
+	{@render children()}
 </AuthButton>

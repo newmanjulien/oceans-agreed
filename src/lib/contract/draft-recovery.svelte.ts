@@ -8,12 +8,14 @@ export type ContractDraft = {
 	version: 1;
 	base: ContractState;
 	choices: SavedSelections;
+	lifecycles?: Record<string, string>;
 	request: ContractSaveRequest | null;
 	conflict: boolean;
 };
 const memory = new Map<string, ContractDraft>();
 const volatileKeys = new Set<string>();
 const deletedUsers = new Set<string>();
+const removedMemberships = new Set<string>();
 const prefix = (userId: string) =>
 	`agreed:drafts:v1:${encodeURIComponent(env.PUBLIC_CONVEX_URL ?? '')}:${encodeURIComponent(userId)}:`;
 
@@ -24,6 +26,33 @@ function selections(value: unknown): value is SavedSelections {
 		!Array.isArray(value) &&
 		Object.keys(value).length <= MAX_SELECTED_CONCESSIONS &&
 		Object.entries(value).every(([id, choice]) => id.length > 0 && typeof choice === 'string')
+	);
+}
+function lifecycle(value: unknown): value is string {
+	return typeof value === 'string' && value.trim().length > 0 && value.length <= 300;
+}
+function lifecycles(value: unknown) {
+	return value === undefined || (selections(value) && Object.values(value).every(lifecycle));
+}
+function reviews(value: unknown) {
+	return (
+		value === undefined ||
+		Boolean(
+			value &&
+			typeof value === 'object' &&
+			!Array.isArray(value) &&
+			Object.keys(value).length <= MAX_SELECTED_CONCESSIONS &&
+			Object.entries(value).every(
+				([id, review]) =>
+					id.length > 0 &&
+					review &&
+					typeof review === 'object' &&
+					!Array.isArray(review) &&
+					typeof review.concessionId === 'string' &&
+					lifecycle(review.lifecycle) &&
+					['pending', 'approved', 'rejected'].includes(review.status)
+			)
+		)
 	);
 }
 function valid(value: unknown, id: string): value is ContractDraft {
@@ -37,7 +66,9 @@ function valid(value: unknown, id: string): value is ContractDraft {
 		draft.base.revision >= 0 &&
 		(draft.base.lastOperationId === null || typeof draft.base.lastOperationId === 'string') &&
 		selections(draft.base.selectedConcessions) &&
+		reviews(draft.base.reviews) &&
 		selections(draft.choices) &&
+		lifecycles(draft.lifecycles) &&
 		(draft.request === null ||
 			(draft.request?.id === id &&
 				Number.isSafeInteger(draft.request.expectedRevision) &&
@@ -45,7 +76,8 @@ function valid(value: unknown, id: string): value is ContractDraft {
 				typeof draft.request.operationId === 'string' &&
 				draft.request.operationId.trim().length > 0 &&
 				draft.request.operationId.length <= 200 &&
-				selections(draft.request.selectedConcessions)))
+				selections(draft.request.selectedConcessions) &&
+				lifecycles(draft.request.selectionLifecycles)))
 	);
 }
 
@@ -53,14 +85,18 @@ function valid(value: unknown, id: string): value is ContractDraft {
 export class DraftJournal {
 	memoryOnly = $state(false);
 	private key: string;
+	private namespace: string;
 	constructor(
 		private userId: string,
-		private contractId: string
+		private contractId: string,
+		membershipId?: string
 	) {
-		this.key = prefix(userId) + encodeURIComponent(contractId);
+		this.namespace = prefix(userId) + (membershipId ? encodeURIComponent(membershipId) + ':' : '');
+		this.key = this.namespace + encodeURIComponent(contractId);
 	}
 	read(): ContractDraft | null {
-		if (!browser || deletedUsers.has(this.userId)) return null;
+		if (!browser || deletedUsers.has(this.userId) || removedMemberships.has(this.namespace))
+			return null;
 		this.memoryOnly = volatileKeys.has(this.key);
 		if (memory.has(this.key)) return structuredClone(memory.get(this.key)!);
 		try {
@@ -76,7 +112,7 @@ export class DraftJournal {
 		return null;
 	}
 	write(draft: ContractDraft | null) {
-		if (!browser || deletedUsers.has(this.userId)) return;
+		if (!browser || deletedUsers.has(this.userId) || removedMemberships.has(this.namespace)) return;
 		if (draft) memory.set(this.key, structuredClone(draft));
 		else memory.delete(this.key);
 		try {
@@ -99,7 +135,16 @@ export class DraftJournal {
 
 export function discardUserDrafts(userId: string) {
 	deletedUsers.add(userId);
-	const namespace = prefix(userId);
+	discardNamespace(prefix(userId));
+}
+
+export function discardMembershipDrafts(userId: string, membershipId: string) {
+	const namespace = prefix(userId) + encodeURIComponent(membershipId) + ':';
+	removedMemberships.add(namespace);
+	discardNamespace(namespace);
+}
+
+function discardNamespace(namespace: string) {
 	for (const key of memory.keys()) if (key.startsWith(namespace)) memory.delete(key);
 	for (const key of volatileKeys) if (key.startsWith(namespace)) volatileKeys.delete(key);
 	if (!browser) return;
@@ -109,6 +154,6 @@ export function discardUserDrafts(userId: string) {
 			if (key?.startsWith(namespace)) sessionStorage.removeItem(key);
 		}
 	} catch {
-		/* No further drafts can be written for this deleted identity. */
+		/* This namespace remains invalidated even when storage is unavailable. */
 	}
 }

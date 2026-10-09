@@ -2,19 +2,21 @@
 
 The custom `/login`, `/join`, Settings, and deletion components adapt Overbase
 revision `61c97882e42a2b3cbb4fccbb7448a954e147367d`. Signup ends after email
-verification. Invitations are optional; anyone can sign up. All registered users
-share Oceans, contracts, and the playbook. Only admins can edit the shared company
-name and avatar in Settings; other access is shared.
-Clerk owns identity and sign-in email. Convex owns names, avatars, roles, and company
-settings. Settings never update another user's profile or Clerk's name.
+verification. Anyone can sign up; company membership requires explicit company
+creation or acceptance of a colleague's invitation. Companies are private, with
+no discovery or email-domain matching. Accounts belong to one company at a time.
+Clerk owns identity and verified sign-in email. Convex owns profiles, memberships,
+roles, company settings, and invitation records. Settings never updates another
+user's profile or Clerk's name. See [the company schema and rollout
+runbook](private-companies-rollout.md) before updating an existing deployment.
 
 ## Development configuration
 
 Create an Agreed **development** application in Clerk. Enable email verification
 codes for signup and sign-in, open signup, self-deletion, and reverification for
 sensitive actions. Disable required passwords, names, and legal acceptance so the
-custom signup can finish with an email and code. Organizations and onboarding are
-unnecessary. Configure `/login` and `/join` as the custom auth routes, `/` as the
+custom signup can finish with an email and code. Clerk Organizations are
+unnecessary; Agreed supplies its own company onboarding and invitation acceptance. Configure `/login` and `/join` as the custom auth routes, `/` as the
 fallback destination, and the frontend development origin as an allowed redirect.
 
 Copy `.env.example` to `.env.local`, keeping the existing Convex deployment values.
@@ -48,7 +50,7 @@ before pushing the authentication config:
 | `APP_URL`                      | Frontend origin, e.g. `http://localhost:5173`    |
 
 Use the Convex dashboard to set secrets without including them in command history.
-`APP_URL` also controls approval email links. Secrets are never public environment
+`APP_URL` controls approval and company invitation email links. Secrets are never public environment
 variables. Each environment must use its own matching Clerk application and keys.
 
 Add a Clerk webhook for **user.deleted** at
@@ -59,41 +61,95 @@ delivery is acknowledged only after the permanent deletion marker commits.
 Run `npx convex dev` against the intended development deployment, then `npm run dev`.
 The browser uses Convex's authenticated Svelte integration with Clerk's `convex`
 token. Each Clerk session gets a fresh Convex client; local snapshot caches are
-scoped to identity and cleared on logout, deletion, or account changes. Server
+scoped to profile and membership and cleared on logout, deletion, account changes,
+or membership changes. Server
 snapshot reads forward an authenticated token and return `private, no-store`.
 
 ## Roles and permissions
 
-`src/convex/permissions.ts` owns the role validator and capability policy. The
-viewer query computes `permissions` from the stored profile role, so role changes
-update the existing subscription without another request. Settings uses
-`editCompanyProfile` to show the company name and avatar editors. Everyone can
-edit their own name and avatar; their role is read-only.
+`src/convex/permissions.ts` defines personal roles and capabilities. Profiles store
+required `rep` / `admin` roles; memberships store only profile and company identity.
+Any authenticated user can select either role for themselves in Settings, without
+approval. `settings.savePersonalRole({ role })` resolves the caller from identity,
+accepts no target profile ID, and returns `null`. There is no operator or team role
+assignment API.
 
-Convex enforces capabilities through `requirePermission`. Company name saves
-authorize in the writing transaction. Company avatar uploads authorize before
-reading/storing the image and again in the committing mutation, using the current
-authenticated profile. A demotion or deletion during upload prevents the commit;
-the HTTP action deletes the newly uploaded blob after a rejected save.
+Admin grants company name, approval recipient, company avatar, invitation, and
+member removal permissions. Admins can remove any colleague except the owner or
+themselves; self-removal uses Leave company. Company ownership is independent of
+role. Only the owner transfers ownership, including when they choose Rep. Owners
+must transfer before leaving or deleting their account. Transfers and owner
+recovery never change personal roles. Playbook and contract authoring retain their
+existing access.
 
-New accounts default to `rep`. Assign an admin through the internal
-`profiles.assignRole` mutation in the Convex dashboard: select the intended
-deployment, identify the profile by its issuer-qualified identity, and supply
-`{ "profileId": "<profile ID>", "role": "admin" }`. The same mutation accepts
-`rep` to demote an account. There is no public role-changing endpoint. Existing
-roles are preserved; review admins previously assigned through self-service role
-selection before rollout.
+Every public company operation supplies its stable `membershipId`. Convex resolves
+membership from authenticated identity and rejects stale or foreign IDs. Company
+avatar uploads authorize before storage and again in the committing mutation;
+switching to Rep during upload prevents commit and rejected uploads are cleaned up.
+The viewer reacts to profile role changes. Session, editor, cache, and draft
+identity remain profile plus membership, so role changes preserve mounted drafts.
 
-For each future restriction, add a named capability to the policy and permissions
-validator, use it in the affected UI, and enforce it in every backend operation
-that needs it. Keep role comparisons in the policy; do not add restrictions just
-because a route is named Admin.
+New profiles default to Rep. Creating a company atomically sets its creator to
+Admin and owner. Accepting an invitation preserves the chosen personal role, which
+also persists when leaving or joining a company.
+
+Company invitations have a dedicated `/invitation` flow. A valid random link
+shows the company and fixed invited email before authentication. Continue sends
+an email code; Clerk signs in an existing account or automatically creates an
+account using the verified email. Invitees then explicitly choose Join [Company]
+and enter the workspace without company setup. Account switching returns directly
+to the invitation. The anonymous preview exposes no invitation ID or acceptance
+generation; authenticated resolution and acceptance require the exact verified email.
+Verified signed-in requests skip the anonymous preview. Expiry is evaluated by the
+backend after its cached database lookup; the anonymous flow uses the remaining
+duration rather than comparing expiry against the recipient's device clock.
+Resend rotates the hashed token and delivery generation; revoke invalidates the link.
+Old Clerk invitations do not create memberships and must be reissued through the
+company team page. Configure Gmail SMTP backend credentials for invitations and
+approvals, and set each company's approval recipient in Settings. See the runbook
+for expiry, cooldown, and queued-recipient behavior.
 
 ## Session transitions and contract drafts
 
-A persistent session controller coordinates connection, workspace preparation,
-logout, and account loss. Temporary token or profile errors keep an admitted
-workspace mounted with interaction blocked. A rejected connection shows retry
+While an email code is being sent and entered, sign-in preloads the destination's
+route modules and opens an unused Convex connection. Document destinations also
+preload the document host. No account query runs on that connection until the
+verified session owns it. Failed code requests, failed invitation acceptance,
+changing email, or leaving sign-in without a session close the unused connection;
+a session takes ownership once, and retries create a fresh client. Code preloading
+does not run protected server loads. The authenticated account host preloads
+independently of the workspace. Workspace destinations preload Workspace, Home
+destinations also preload Home, and entry destinations avoid those imports.
+The live viewer decides account readiness; the workspace boundary separately
+requires membership. See [Account entry and workspace routes](account-routes.md).
+
+Once Clerk accepts the code, the Convex token request overlaps navigation. Clients
+enable Convex 1.46's experimental `initialAuthTokenReuse` option to avoid an
+immediate second token fetch and the resulting re-execution of authenticated
+queries. Convex validates the initial token, refreshes before expiry, and forces
+a fresh token on rejection. Explicit recovery also bypasses Clerk's token cache.
+Check this option when upgrading Convex.
+
+Login and destination startup share a centered, neutral loading wheel. Recovery
+text and controls appear for failed or delayed startup. Account and membership
+readiness still determine whether Home or company setup appears. Home's header
+and controls do not wait for the first contract-list response; that list owns its
+loading and error states, including a 15-second read deadline. Company setup
+appears without waiting for invitations, and invitations update within the chosen
+screen rather than switching it.
+
+In development, or with `PUBLIC_CONTRACT_PERF=1`, `window.__accountStartup`
+records code submission, auth acceptance, navigation, backend authentication,
+account readiness, admission (`usable`), and the first dashboard result paint.
+Compare timestamps within the same `attemptId` to separate verification,
+navigation, connection, account preparation, and list loading. These markers
+support browser measurements; the existing automated performance suite does
+not measure real email-code login latency or visual continuity.
+
+A root session controller persists across entry and workspace routes and
+coordinates connection, account readiness, logout, and account loss. The lazy
+authenticated account host owns the transport and viewer. Temporary token or
+profile errors keep its admitted subtree mounted with interaction blocked. A rejected connection shows retry
 and logout actions; after ten seconds, a pending connection or preparation also
 offers these actions. Retrying requests a fresh Clerk token and replaces the
 Convex client while preserving mounted editors. Ordinary Clerk resource refreshes
@@ -115,8 +171,8 @@ its snapshot fails. A definitively rejected first creation releases its argument
 so a corrected name can be submitted. Once an attempt is uncertain, retries keep
 its original arguments until creation is confirmed. Approval, Home, Settings, and invitation writes are not
 automatically replayed. Their existing actions allow explicit retry after recovery.
-Team refreshes invitations after recovery and stops interrupted batches with all
-unconfirmed addresses retained. Approval eligibility uses fresh subscribed status.
+Team subscribes to its company invitations and stops interrupted send batches
+with unconfirmed addresses retained. Approval eligibility uses fresh subscribed status.
 
 Logout freezes editing and waits for pending contract saves before calling Clerk.
 If saving fails or remains pending, the user can retry, cancel logout, or explicitly
@@ -127,13 +183,16 @@ canceling logout to save them or explicitly discarding them. Closing a session
 bypasses editor navigation guards so they cannot block the login redirect.
 
 Contract selection drafts have a separate operation journal in `sessionStorage`,
-scoped to deployment, Clerk user, and contract. It records intended selections,
+scoped to deployment, Clerk user, membership, and contract. It records intended selections,
 the confirmed base revision, any immutable pending request, and conflict status
 before sending. Confirmed snapshot caches never contain unsaved intent. Drafts
 survive refresh and unexpected session loss in the same tab; only the same signed-in
-user can restore them. The browser discards them when the tab closes. If storage
+user with the same live membership can restore them. The browser discards them when the tab closes. If storage
 is unavailable, an explicit warning says changes are retained only in memory.
 Playbook authoring drafts remain in the mounted editor and do not use this journal.
+Membership loss clears the previous membership’s journal and cache, then remounts
+the workspace. Leaving a company flushes pending editor changes before removing
+membership, with explicit discard available after a failed flush.
 
 Recovery waits for fresh authenticated server metadata. An acknowledged operation
 is not replayed; an unchanged base can retry the original request; a changed base
@@ -150,43 +209,40 @@ the latest intent is confirmed, or the user explicitly resolves a conflict.
 “Use latest version” pauses follow-up saving while waiting for an active request.
 If its outcome is still uncertain, it retains the draft and reports failure.
 
-## Existing contract attribution
+## Fresh development reset
 
-Before the first sign-in, choose the account that should permanently own legacy
-contracts. The first verified profile initialization records this owner atomically;
-subsequent accounts cannot replace it. Business operations stay blocked while jobs
-assign up to four contracts per transaction. The preparing screen remains until
-the workspace's `ready` flag is true.
+The strict schema replaces the legacy migration workflow. Clear incompatible live
+records before deploying it. Export Convex with storage and retain matching code,
+configuration, and a secure Clerk user inventory first. Deleting Clerk accounts
+also deletes their sessions; a Convex backup cannot restore them.
 
-Rehearse on development data before production rollout. Inspect the shared
-`workspace` record, confirm `legacyOwnerId` belongs to the intended account, and
-confirm every `savedContracts` row has `creatorId`. The initial schema intentionally
-keeps `creatorId` optional for compatibility with existing rows. **After verified
-backfill completion on every deployment receiving the schema**, change its
-validator to `v.id('profiles')` and deploy that final schema. New contract creation
-already requires and atomically records the authenticated creator.
-
-If that owner is deleted during attribution, their marker remains permanent.
-Attribution finishes to the recorded owner before cleanup begins. It never moves
-legacy contracts to a colleague.
+Quiesce writes and recurring/queued work, delete accounts in the confirmed
+development Clerk instance, and clear all application data, retained legacy tables,
+and storage. Deploy the matching backend/frontend, recreate through verified signup,
+and seed the actual company ID. Follow [the reset runbook](private-companies-rollout.md#fresh-development-reset).
 
 ## Deletion and recovery
 
-Settings requires the phrase **delete my account**. Clerk deletion runs first,
-with reverification and retry when needed. A Clerk rejection leaves Convex data
+Owners must transfer ownership before Agreed allows account deletion. Settings
+requires the phrase **delete my account**. A server-side ownership check runs
+before each Clerk deletion attempt, including retries after reverification.
+Clerk then deletes the account. A Clerk rejection leaves Convex data
 intact. Successful deletion clears local state and redirects directly to `/login`
 from the persistent auth bridge, even if session loss has already removed the
 deletion modal. It does not wait for a redundant sign-out request or Convex cleanup.
 Protected routes also redirect when Clerk finishes loading without a session.
 
 The verified webhook records an issuer-qualified deletion marker and queues
-cleanup. That transaction immediately blocks the caller and excludes their
-contracts from Home, direct reads, edits, and approval dispatch. Cleanup removes
-contract-specific snapshots, approval records, contracts, personal avatar, and
-profile in bounded batches. It preserves the shared company, playbook, shared
-immutable template versions, colleagues, deletion markers, and retry receipts.
-Pending approval sends are canceled when possible; delivered emails cannot be
-recalled.
+cleanup. That marker immediately denies the deleted identity. Cleanup removes its
+membership, personal avatar, and profile; it retains the company, contracts,
+snapshots, approval records, and receipts. Former creators display as former
+colleagues without disclosing their profile. Company contracts remain accessible
+to current colleagues and queued approvals retain their company recipient.
+
+External owner deletion transfers ownership to the oldest live remaining membership
+using bounded pagination, without role preference or changing the successor’s role. If no successor
+exists, the company becomes ownerless and requires internal operator recovery;
+there is no public company claim flow. Details are in the company runbook.
 
 Every 15 minutes reconciliation checks registered profiles against Clerk with one
 batch lookup per 25-profile page and resumes unfinished jobs. Only an account
@@ -204,41 +260,36 @@ production build. Existing fixtures carry authenticated identities. Their saving
 conflict, retry, creation, immutable publication, scheduling, and cache assertions
 remain in place; no new test suite was added.
 
-Live Clerk configuration and browser checks require the development keys. Use two
-accounts to check signup/login, code resend and back navigation, invitation ticket
-signup, revoke/resend, explicit profile/company/avatar saves, trusted role changes,
-creator attribution updates, and logout/account switching. Check the copied auth
-and settings layouts on desktop/mobile, keyboard focus, Escape, and modal focus
-restoration against the reference. Check anonymous Convex calls and the snapshot
-HTTP endpoint are rejected.
+Live configuration and browser checks need development Clerk keys and SMTP setup.
+Use accounts in two companies plus an unaffiliated account. Verify email codes,
+signup/login, explicit invitation acceptance, wrong-email and rotated/revoked links,
+create/wait onboarding, role and ownership changes, company/personal avatar saves,
+and owner deletion restrictions. Confirm companies never appear from domain matching.
 
-Using one admin and one rep, confirm the company editors appear only for the admin
-and both accounts can save personal names and avatars. Call `settings.saveCompanyName`
-and POST `/avatar?company=true` directly as the rep and confirm rejection without
-company changes. Confirm public self-promotion is unavailable. Demote an admin
-while a company avatar upload is pending and confirm it cannot commit or replace
-the existing avatar; check the rejected upload is cleaned up. Promote/demote via
-`profiles.assignRole` and confirm Settings updates without a reload. The local
-performance suite and build do not verify these live authorization checks.
+Call company APIs with another company's record IDs and stale membership IDs and
+confirm rejection. Remove a colleague with a contract and upload open; confirm
+immediate access loss, draft/cache cleanup, rejected upload cleanup, retained
+company contracts, and former-colleague attribution. Check anonymously called
+Convex operations and the snapshot HTTP endpoint are rejected.
 
-On disposable development data, delete the initial owner midway through backfill,
-redeliver the signed webhook, interrupt and resume cleanup, and simulate a missed
-webhook by deleting an account in Clerk and waiting for reconciliation. Confirm
-contracts become unreadable before physical removal and colleagues retain their
-contracts, playbook, and company. Confirm a failed Clerk request never deletes data.
-These live checks and the post-backfill required-field deployment are rollout gates;
-the local build does not certify them. Do not run the destructive rehearsal on
-production data.
+On disposable development data, interrupt and resume the company seed import.
+Delete an owner externally, redeliver signed webhooks, and simulate a missed webhook
+through reconciliation. Check live successor selection and ownerless recovery.
+Compare scoped counts, snapshot links, historical creator IDs and selections.
+Confirm a failed Clerk request never deletes data. The local suite/build does not
+certify these live authorization and reset checks.
 
-Also check the session transitions with development accounts: interrupt the
-connection during a selection save, start logout, and exercise retry, cancel,
-and discard after the ten-second feedback appears. Reject token/profile requests
-after opening a contract and confirm its editor stays mounted; retry and confirm
-reconciliation uses the new client. Refresh with an unacknowledged save, sign back
-in as the same user, and check both committed and uncommitted outcomes. Change the
-contract from a second session and confirm neither recovery nor refresh silently
-overwrites it. Switch users and confirm drafts do not restore across identities.
-Repeat logout/session loss during contract creation and playbook authoring to
-check navigation guards, failed Clerk logout, and callbacks from closed clients.
+Exercise session transitions: interrupt selection saves, retry authentication with
+an editor mounted, and use logout save/cancel/discard. Refresh with an unacknowledged
+save and verify committed and uncommitted recovery. Concurrently edit the contract
+from another session and confirm recovery never silently overwrites it. Switch
+accounts and companies and confirm old drafts never restore across those boundaries.
+Repeat during creation and authoring to check navigation guards and late callbacks.
 Finally, complete deletion while its modal unmounts and confirm direct navigation
 to `/login` without waiting for webhook cleanup or an extra sign-out call.
+
+Review mobile layouts, keyboard focus, Escape, and focus restoration for onboarding,
+settings, team confirmations, and modals. Verify actual invitation and approval
+SMTP delivery, including distinct recipients for two companies and a recipient
+change while an approval is queued. These remain manual rollout gates; no new
+browser or backend test suite was added.

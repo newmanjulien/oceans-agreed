@@ -1,27 +1,75 @@
-import type { ConcessionSelection, PlaybookItemRecord } from '../playbook/model';
+import type { SourceRange } from './source-model';
+import type { ContractState } from './saved';
+import type { Id } from '../../convex/_generated/dataModel';
 
-/** A valid selected concession needs approval when its frozen instruction is nonblank. */
-export function requiresApproval(
-	items: readonly PlaybookItemRecord[],
-	selection: ConcessionSelection
-) {
-	return items.some(
-		(item) =>
-			Boolean(item.instructions?.changesNeedApproval?.trim()) &&
-			item.concessions.some((c) => c.id === selection[item._id])
+export type ReviewStatus = 'pending' | 'approved' | 'rejected';
+export type ReviewDecision = Exclude<ReviewStatus, 'pending'>;
+export type ReviewTag = {
+	itemId: string;
+	concessionId: string;
+	concessionPosition: number;
+	lifecycle: string;
+	status: ReviewStatus;
+	description: string;
+	/** The main edit anchors the single tag; approval covers every concession change. */
+	range: SourceRange;
+	admin: boolean;
+	disabled: boolean;
+};
+export type ReviewNavigation = { afterItemId?: string };
+export const legacyLifecycle = (itemId: string, concessionId: string) =>
+	JSON.stringify(['legacy', itemId, concessionId]);
+
+/** Approval metadata never contributes to document or Word content identity. */
+export function selectionLifecycles(state: ContractState, required: ReadonlySet<string>) {
+	if (!required.size) return {};
+	return Object.fromEntries(
+		Object.entries(state.selectedConcessions)
+			.filter(([id]) => required.has(id))
+			.map(([id, concessionId]) => [
+				id,
+				state.reviews?.[id as Id<'playbookItems'>]?.concessionId === concessionId
+					? state.reviews[id as Id<'playbookItems'>].lifecycle
+					: legacyLifecycle(id, concessionId)
+			])
 	);
 }
-
-/** Compare compact request references with the choices in the frozen snapshot. */
-export function matchesApprovalSelection(
-	items: readonly PlaybookItemRecord[],
-	selection: ConcessionSelection,
-	requested: readonly { itemId: string; concessionPosition: number }[]
+export function reviewStatus(
+	state: Pick<ContractState, 'reviews'>,
+	itemId: string,
+	concessionId: string,
+	lifecycle: string
+): ReviewStatus {
+	const review = state.reviews?.[itemId as Id<'playbookItems'>];
+	return review?.concessionId === concessionId && review.lifecycle === lifecycle
+		? review.status
+		: 'pending';
+}
+/** Only the current pending lifecycles determine whether an email already covers this review. */
+export function approvalCoversPending(
+	pending: readonly {
+		itemId: string;
+		concessionId: string;
+		concessionPosition: number;
+		lifecycle: string;
+	}[],
+	requested: readonly {
+		itemId: string;
+		concessionPosition: number;
+		lifecycle?: string;
+		reviewStatus?: ReviewStatus;
+	}[]
 ) {
-	if (Object.keys(selection).length !== requested.length) return false;
-	const byId = new Map<string, PlaybookItemRecord>(items.map((item) => [item._id, item]));
-	return requested.every(({ itemId, concessionPosition }) => {
-		const concession = byId.get(itemId)?.concessions[concessionPosition];
-		return concession !== undefined && selection[itemId] === concession.id;
+	if (!pending.length) return false;
+	const byItem = new Map(requested.map((s) => [s.itemId, s]));
+	return pending.every((current) => {
+		const old = byItem.get(current.itemId);
+		return (
+			old &&
+			old.concessionPosition === current.concessionPosition &&
+			(old.lifecycle ?? legacyLifecycle(current.itemId, current.concessionId)) ===
+				current.lifecycle &&
+			(old.reviewStatus ?? 'pending') === 'pending'
+		);
 	});
 }

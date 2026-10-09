@@ -75,9 +75,8 @@ record is already absent. It does not queue behind another operation.
 
 Semantic comparison preserves business text and structured references while
 excluding persistence metadata. Creation mode is not part of the business payload.
-The storage schema accepts old `authoringMode` values only for compatibility;
-full-item saves remove that unused field. Deploy schema and mutations with the
-frontend. Optional metadata needs no reset or reseeding.
+Live records and immutable snapshots contain no creation-mode field. Deploy schema
+and mutations with the frontend. Optional revision metadata needs no reset or reseeding.
 
 ## Source selection and validation
 
@@ -98,3 +97,52 @@ original failures in a single-draft geometry memo and the validation result's
 `diagnostic`, while `reason` contains safe
 loading/size, translated geometry or generic fallback feedback. Revalidation clears
 resolved feedback without changing transport or conflict outcomes.
+
+## Contract concession reviews
+
+Each required concession application has a lifecycle ID, saved atomically with the
+selection. Changing, removing, or reapplying a choice creates a new application;
+renaming the buyer or saving another choice preserves existing decisions. Required
+choices applied by reps start pending; choices applied by admins start approved and
+record the admin's decision. Legacy saved choices without metadata start pending.
+
+Current review state lives on the saved contract. Admin decisions validate company
+access, the immutable template's approval requirement, and the current selection and
+lifecycle. Decisions update only review metadata, without advancing the selection
+revision or invalidating document rendering and Word preparation. Live subscriptions
+carry decisions to both roles; same-revision save responses cannot replace a newer
+live decision. Each decision also appends the admin's identity, previous and resulting
+status, and timestamp to `concessionDecisions`. Scoped operation receipts make retries
+idempotent even after another admin decides; distinct committed decisions use the
+latest status. Automatic approval receipts and review receipts have separate namespaces.
+Live confirmation retires an ambiguous client attempt, so a later override uses a
+fresh operation rather than replaying its earlier receipt.
+
+Each applied concession owns one review state and one tab per affected part. Edits
+owned by the same instruction trigger share a location; changes outside its triggers
+are grouped by source container. This keeps an explicitly selected additional part
+separate, including when it lies elsewhere in the same paragraph, and groups legacy
+concessions with several edits in one part. Each location anchors once at its first
+visible edit, without repeating across page splits. All instances use the same
+concession decision. Choices without text changes anchor once per instruction trigger.
+Trimmed source text falls back to the nearest visible token in the same passage.
+An unavailable anchor does not block navigation to the remaining reviews. Different
+locations stack when they overlap.
+Source parsing, text measurements, and location projections are cached per immutable
+page. Sorted source intervals limit projection scans to matching tokens. Appending
+pages only scans the new content; scale changes reuse page-local
+coordinates. Status changes update labels without remeasuring text, and only the
+open review menu is mounted.
+Admins can change either decision using the same menu; reps see read-only status and
+remove a rejected choice to clear it. Reviews are disabled until the current application
+is saved. Word download requires every selected required concession to be approved.
+
+An explicit approval request freezes the pending applications and reviewed context
+into the existing recoverable email dispatch. Sending an email never changes review
+status. Its `?review=1` link waits for current state and mounted pages, then focuses the
+first pending concession's tab. A stale link reports that nothing is waiting and focuses the first
+remaining tab or document. After a decision, navigation advances to the next pending
+application in source order and wraps. Navigation consumes each request by identity,
+including when a workspace reopens a retained viewer. The stale-link message clears
+when another concession starts waiting. Decision history is retained without a UI and
+removed in bounded batches when the contract is deleted.

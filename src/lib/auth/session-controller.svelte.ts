@@ -1,8 +1,8 @@
 import type { SessionEditor, SessionPhase } from './viewer-session.svelte';
-import { beginStartupAttempt, recordStartup } from './startup-perf';
+import { beginStartupAttempt } from './startup-perf';
 import { ReadAttempt } from './attempt';
 
-/** Owns protected workspace admission and session recovery across routed editors. */
+/** Owns account readiness, session recovery, and safe editor shutdown across routes. */
 export class SessionController {
 	phase = $state<SessionPhase>('loading');
 	error = $state('');
@@ -11,14 +11,12 @@ export class SessionController {
 	prepared = $state<string | null>();
 	userId = $state<string | null>(null);
 	admitted = $state(false);
-	private destinationReady = false;
-	private destinationError = '';
 	private readAttempt: ReadAttempt | undefined;
 	private readFailed = false;
 	private authLoading = true;
 	private authenticated = false;
-	private workspaceReady = false;
-	private workspaceError = '';
+	private accountReady = false;
+	private accountError = '';
 	private editors = new Set<SessionEditor>();
 	private generation = 0;
 	private timer: ReturnType<typeof setTimeout> | undefined;
@@ -93,9 +91,9 @@ export class SessionController {
 			if (
 				this.authenticated &&
 				!this.authLoading &&
-				this.workspaceReady &&
-				!this.workspaceError &&
-				['ready', 'saving-before-logout'].includes(this.phase)
+				this.accountReady &&
+				!this.accountError &&
+				['ready', 'saving-before-logout', 'saving-before-company-exit'].includes(this.phase)
 			)
 				editor.resume();
 			else editor.suspend();
@@ -114,6 +112,7 @@ export class SessionController {
 		const voluntary = this.phase === 'signing-out';
 		this.generation++;
 		this.actions.cancelReads();
+		if (previous && sessionId) this.actions.clear();
 		this.transportGeneration++;
 		this.attempt = null;
 		for (const editor of this.editors) {
@@ -122,11 +121,9 @@ export class SessionController {
 		}
 		this.authLoading = true;
 		this.authenticated = false;
-		this.workspaceReady = false;
-		this.destinationReady = false;
-		this.destinationError = '';
+		this.accountReady = false;
 		this.admitted = false;
-		this.workspaceError = '';
+		this.accountError = '';
 		this.error = '';
 		this.prepared = sessionId;
 		this.userId = userId;
@@ -141,14 +138,9 @@ export class SessionController {
 		this.authenticated = authenticated;
 		this.updatePhase();
 	}
-	reportWorkspace(ready: boolean, error = '') {
-		this.workspaceReady = ready;
-		this.workspaceError = error;
-		this.updatePhase();
-	}
-	reportDestination(ready: boolean, error = '') {
-		this.destinationReady = ready;
-		this.destinationError = error;
+	reportAccount(ready: boolean, error = '') {
+		this.accountReady = ready;
+		this.accountError = error;
 		this.updatePhase();
 	}
 	private updatePhase() {
@@ -156,26 +148,26 @@ export class SessionController {
 			this.syncEditors();
 			return;
 		}
-		if (['saving-before-logout', 'signing-out', 'signed-out'].includes(this.phase)) {
+		if (
+			['saving-before-logout', 'saving-before-company-exit', 'signing-out', 'signed-out'].includes(
+				this.phase
+			)
+		) {
 			this.syncEditors();
 			return;
 		}
 		if (this.authLoading) this.setPhase('authenticating');
 		else if (!this.authenticated) this.setPhase('authentication-error');
-		else if (this.workspaceError || this.destinationError) this.setPhase('authentication-error');
-		else this.setPhase(this.workspaceReady && this.destinationReady ? 'ready' : 'preparing');
+		else if (this.accountError) this.setPhase('authentication-error');
+		else this.setPhase(this.accountReady ? 'ready' : 'preparing');
 		if (this.phase === 'ready' && !this.admitted) {
 			this.admitted = true;
-			recordStartup('usable');
 		}
 		this.syncEditors();
 	}
 	get authenticationError() {
 		return (
-			this.error ||
-			this.workspaceError ||
-			this.destinationError ||
-			'We couldn’t connect your account. Try again or log out.'
+			this.error || this.accountError || 'We couldn’t connect your account. Try again or log out.'
 		);
 	}
 	retryAuth() {
@@ -185,15 +177,43 @@ export class SessionController {
 		beginStartupAttempt();
 		this.authLoading = true;
 		this.authenticated = false;
-		this.workspaceReady = false;
-		this.workspaceError = '';
+		this.accountReady = false;
+		this.accountError = '';
 		this.error = '';
 		this.setPhase('authenticating');
 		this.startReadAttempt();
-		this.destinationError = '';
 		for (const editor of this.editors) editor.restartTransport();
 		this.transportGeneration++;
 	}
+	async exitCompany(action: () => Promise<unknown>, discard = false) {
+		if (this.blocked || this.attempt || this.disposed)
+			throw new Error('Please wait until your account is ready.');
+		const generation = ++this.generation;
+		this.setPhase('saving-before-company-exit');
+		try {
+			for (const editor of this.editors) {
+				if (!this.current(generation)) throw new Error('Your session changed. Please try again.');
+				if (discard) {
+					editor.suspend();
+					editor.discard();
+				} else {
+					editor.retry();
+					if (editor.pending && !(await editor.flush()))
+						throw new Error(
+							'Your changes could not be saved. Retry leaving, or discard your changes and leave.'
+						);
+				}
+			}
+			if (!this.current(generation)) throw new Error('Your session changed. Please try again.');
+			await action();
+		} finally {
+			if (this.current(generation)) {
+				this.setPhase('preparing');
+				this.updatePhase();
+			}
+		}
+	}
+
 	signOut() {
 		if (this.attempt || this.phase === 'signed-out' || this.disposed)
 			return this.attempt ?? Promise.resolve();

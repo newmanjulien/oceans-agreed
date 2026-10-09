@@ -480,7 +480,7 @@ function subtractGroup(
 			...(owner
 				? {
 						triggerState:
-							owner.getAttribute('aria-pressed') === 'true'
+							owner.dataset.annotationSelected === 'true'
 								? ('selected' as const)
 								: hoveredAnnotationId !== null &&
 									  interval.annotationIds?.includes(hoveredAnnotationId)

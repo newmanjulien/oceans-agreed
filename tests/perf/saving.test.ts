@@ -15,30 +15,37 @@ const modules = import.meta.glob('../../src/convex/**/*.*s');
 
 async function fixture(selected = false) {
 	const t = convexTest(schema, modules).withIdentity(identity);
-	const profileId = await t.run(initializeViewer);
+	const { profileId, companyId, membershipId } = await t.run(initializeViewer);
 	const ids = await t.run(async ({ db }) => {
-		const first = await db.insert('playbookItems', item);
-		const second = await db.insert('playbookItems', item);
-		const foreign = await db.insert('playbookItems', item);
+		const first = await db.insert('playbookItems', { ...item, companyId });
+		const second = await db.insert('playbookItems', { ...item, companyId });
+		const foreign = await db.insert('playbookItems', { ...item, companyId });
 		const choices = { [first]: 'preferred', [second]: 'preferred' };
+		const versionId = await db.insert('templateVersions', {
+			companyId,
+			publishedAt: 123,
+			blockCount: 1,
+			itemCount: 2,
+			snapshotBytes: 0
+		});
 		const id = await db.insert('savedContracts', {
 			companyName: 'Synthetic Buyer',
+			companyId,
 			creatorId: profileId,
+			templateVersionId: versionId,
 			savedAt: 123,
 			revision: 7,
 			lastOperationId: 'previous-operation',
-			selectedConcessions: selected ? choices : {},
-			blockCount: 1,
-			itemCount: 2
+			selectedConcessions: selected ? choices : {}
 		});
-		await db.insert('contractSnapshotBlocks', { contractId: id, block });
+		await db.insert('templateVersionBlocks', { versionId, block });
 		for (const itemId of [first, second]) {
 			const document = (await db.get('playbookItems', itemId))!;
-			await db.insert('contractSnapshotItems', { contractId: id, itemId, item: document });
+			await db.insert('templateVersionItems', { versionId, itemId, item: document });
 		}
 		return { id, first, second, foreign, choices };
 	});
-	return { t, ...ids };
+	return { t, membershipId, ...ids };
 }
 
 type SaveArgs = FunctionArgs<typeof api.savedContracts.saveChoices>;
@@ -59,8 +66,8 @@ function observeSave(t: Awaited<ReturnType<typeof fixture>>['t'], args: SaveArgs
 			get(target, key, receiver) {
 				if (key === 'query')
 					return (table: Parameters<MutationCtx['db']['query']>[0]) => {
-						if (table === 'contractSnapshotItems') counts.snapshotItems++;
-						if (table === 'contractSnapshotBlocks') counts.snapshotBlocks++;
+						if (table === 'templateVersionItems') counts.snapshotItems++;
+						if (table === 'templateVersionBlocks') counts.snapshotBlocks++;
 						return target.query(table);
 					};
 				const value = Reflect.get(target, key, receiver);
@@ -84,9 +91,10 @@ describe('saving work', () => {
 	});
 
 	it('acknowledges identical selections without snapshot reads, compilation or writes', async () => {
-		const { t, id, first, second, choices } = await fixture(true);
+		const { t, id, first, second, choices, membershipId } = await fixture(true);
 		const before = await t.run(({ db }) => db.get('savedContracts', id));
 		const args = {
+			membershipId,
 			id,
 			selectedConcessions: { [second]: 'preferred', [first]: 'preferred' },
 			expectedRevision: 7,
@@ -98,6 +106,7 @@ describe('saving work', () => {
 			state: {
 				companyName: 'Synthetic Buyer',
 				selectedConcessions: choices,
+				reviews: {},
 				revision: 7,
 				lastOperationId: 'previous-operation'
 			}
@@ -121,9 +130,10 @@ describe('saving work', () => {
 	it.each([0, 1])(
 		'changed %i-selection saves skip baseline reads and compilation',
 		async (size) => {
-			const { t, id, first } = await fixture(size === 0);
+			const { t, id, first, membershipId } = await fixture(size === 0);
 			const selectedConcessions = size ? { [first]: 'preferred' } : {};
 			const { result, counts } = observeSave(t, {
+				membershipId,
 				id,
 				selectedConcessions,
 				expectedRevision: 7,
@@ -150,8 +160,9 @@ describe('saving work', () => {
 	);
 
 	it('observes baseline reads and real compilation for a changed two-selection save', async () => {
-		const { t, id, choices } = await fixture();
+		const { t, id, choices, membershipId } = await fixture();
 		const { result, counts } = observeSave(t, {
+			membershipId,
 			id,
 			selectedConcessions: choices,
 			expectedRevision: 7,
@@ -163,11 +174,12 @@ describe('saving work', () => {
 	});
 
 	it('public saves reject foreign items and invalid concessions without changing state', async () => {
-		const { t, id, first, foreign } = await fixture();
+		const { t, id, first, foreign, membershipId } = await fixture();
 		const before = await t.run(({ db }) => db.get('savedContracts', id));
 		for (const selectedConcessions of [{ [foreign]: 'preferred' }, { [first]: 'invalid' }]) {
 			await expect(
 				t.mutation(api.savedContracts.saveChoices, {
+					membershipId,
 					id,
 					selectedConcessions,
 					expectedRevision: 7,
@@ -180,8 +192,9 @@ describe('saving work', () => {
 	});
 
 	it('acknowledges replays before stale revision checks, and conflicts on other stale saves', async () => {
-		const { t, id, first } = await fixture();
+		const { t, id, first, membershipId } = await fixture();
 		const args = {
+			membershipId,
 			id,
 			selectedConcessions: { [first]: 'preferred' },
 			expectedRevision: 7,
@@ -200,8 +213,14 @@ describe('saving work', () => {
 	});
 
 	it('still validates operations and revisions on unchanged saves and handles missing contracts', async () => {
-		const { t, id } = await fixture();
-		const args = { id, selectedConcessions: {}, expectedRevision: 7, operationId: 'noop' };
+		const { t, id, membershipId } = await fixture();
+		const args = {
+			membershipId,
+			id,
+			selectedConcessions: {},
+			expectedRevision: 7,
+			operationId: 'noop'
+		};
 		for (const operationId of ['', '   ', 'x'.repeat(201)])
 			await expect(
 				t.mutation(api.savedContracts.saveChoices, { ...args, operationId })

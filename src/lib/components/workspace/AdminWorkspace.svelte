@@ -23,14 +23,16 @@
 	import PlaybookEditor from '$lib/components/playbook/PlaybookEditor.svelte';
 	import WorkspaceChrome from './WorkspaceChrome.svelte';
 	import { setInteractionOwner } from '$lib/components/ui/interactions';
-	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import { useViewer, useViewerSession } from '$lib/auth/viewer-session.svelte';
 
 	const client = env.PUBLIC_CONVEX_URL ? useConvexClient() : null;
 	const session = useViewerSession();
+	const accountViewer = useViewer();
+	const membershipId = accountViewer().membership.id;
 	const data: ContractSourceInput = client
 		? {
-				blocks: useQuery(api.contract.getBlocks, {}),
-				items: useQuery(api.playbookItems.list, {})
+				blocks: useQuery(api.contract.getBlocks, { membershipId }),
+				items: useQuery(api.playbookItems.list, { membershipId })
 			}
 		: { blocks: { error: true }, items: { error: true } };
 	onMount(() => (client ? recordAdminQueryOwner() : undefined));
@@ -45,7 +47,7 @@
 		resource?.workspace ?? untrack(() => createContractWorkspace(data))
 	);
 	const { source, renderer, viewer } = workspace;
-	const authoring = new AuthoringSession(client ? convexSaveTransport(client) : null);
+	const authoring = new AuthoringSession(client ? convexSaveTransport(client, membershipId) : null);
 	$effect(() => {
 		const { compiled, geometry, geometryVersion, items } = source;
 		void geometryVersion;

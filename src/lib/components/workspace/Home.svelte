@@ -7,23 +7,26 @@
 	import { createVisibleContractWarming } from '$lib/contract/visible-contracts.svelte';
 	import { getContractSnapshotCache } from '$lib/contract/snapshot-cache';
 	import { useConvexClient, usePaginatedQuery } from 'convex-svelte';
-	import { api } from '../../convex/_generated/api';
+	import { api } from '../../../convex/_generated/api';
 	import AppHeader from '$lib/components/chrome/AppHeader.svelte';
 	import ContractCard from '$lib/components/contracts/ContractCard.svelte';
 	import CompanyNameDialog from '$lib/components/ui/modal/CompanyNameDialog.svelte';
-	import type { Id } from '../../convex/_generated/dataModel';
+	import type { Id } from '../../../convex/_generated/dataModel';
 	import { saveError } from '$lib/contract/saved';
-	import { useViewerSession } from '$lib/auth/viewer-session.svelte';
+	import { useViewer, useViewerSession } from '$lib/auth/viewer-session.svelte';
 	import { ConnectionInterruptedError } from '$lib/auth/convex-session.svelte';
 	import MagnifyingGlassIcon from 'phosphor-svelte/lib/MagnifyingGlassIcon';
 	import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
 	import XIcon from 'phosphor-svelte/lib/XIcon';
+	import LoadingWheel from '$lib/ui/LoadingWheel.svelte';
 	import { getInteractionController, setInteractionOwner } from '$lib/components/ui/interactions';
 	setInteractionOwner(Symbol('home'));
 	const interactions = getInteractionController();
 	const client = env.PUBLIC_CONVEX_URL ? useConvexClient() : null;
 	const cache = getContractSnapshotCache();
 	const session = useViewerSession();
+	const viewer = useViewer();
+	const membershipId = viewer().membership.id;
 	let alive = true;
 	onDestroy(() => {
 		alive = false;
@@ -39,7 +42,7 @@
 	let busy = $state(false);
 	let deleting = $state<Id<'savedContracts'> | null>(null);
 	const contracts = client
-		? usePaginatedQuery(api.savedContracts.browse, () => ({ search: query }), {
+		? usePaginatedQuery(api.savedContracts.browse, () => ({ membershipId, search: query }), {
 				initialNumItems: 24,
 				keepPreviousData: true
 			})
@@ -79,13 +82,27 @@
 		searchInput.dispatchEvent(new Event('input', { bubbles: true }));
 	}
 	onMount(() => {
+		recordStartup('usable');
 		return interactions.shortcut(handleTyping);
+	});
+	let listTimedOut = $state(false);
+	const listLoading = $derived(Boolean(contracts?.isLoading && !contracts.error));
+	const listError = $derived(listTimedOut || Boolean(contracts?.error));
+	$effect(() => {
+		// Each search and recovered transport receives a fresh read budget.
+		void query;
+		void session.transportGeneration;
+		const pending = listLoading;
+		untrack(() => (listTimedOut = false));
+		if (!pending) return;
+		const timer = setTimeout(() => (listTimedOut = true), 15_000);
+		return () => clearTimeout(timer);
 	});
 	const waiting = $derived(
 		pendingSearch ||
 			Boolean(
 				contracts &&
-				!contracts.error &&
+				!listError &&
 				((contracts.isLoading && contracts.status !== 'LoadingMore') || settledQuery !== query)
 			)
 	);
@@ -105,19 +122,14 @@
 		});
 	});
 	$effect(() => {
-		const pending = waiting || session.blocked || Boolean(navigating.to);
+		const pending =
+			listLoading || waiting || listError || session.blocked || Boolean(navigating.to);
 		untrack(() => warming.pending(pending));
 	});
 	let firstResult = $state(false);
 	$effect(() => {
-		const ready = Boolean(contracts && !contracts.error && contracts.status !== 'LoadingFirstPage');
-		const failure = contracts?.error?.message ?? '';
-		untrack(() => {
-			if (!firstResult) {
-				session.reportDestination(ready, failure);
-				if (ready) firstResult = true;
-			}
-		});
+		const ready = Boolean(contracts && !listError && contracts.status !== 'LoadingFirstPage');
+		if (ready) firstResult = true;
 	});
 	$effect(() => {
 		if (!session.admitted || !firstResult) return;
@@ -130,7 +142,7 @@
 		busy = true;
 		renameError = null;
 		try {
-			await client.mutation(api.savedContracts.rename, { id, companyName: name });
+			await client.mutation(api.savedContracts.rename, { membershipId, id, companyName: name });
 			if (!alive) return;
 			if (session.transportGeneration !== generation) throw new ConnectionInterruptedError();
 			cache.rename(id, name);
@@ -156,7 +168,7 @@
 		deleting = id;
 		actionError = null;
 		try {
-			await client.mutation(api.savedContracts.remove, { id });
+			await client.mutation(api.savedContracts.remove, { membershipId, id });
 			if (!alive) return;
 			if (session.transportGeneration !== generation) throw new ConnectionInterruptedError();
 			cache.remove(id);
@@ -169,12 +181,6 @@
 	}
 </script>
 
-<svelte:head
-	><title>Home | Agreed</title><meta
-		name="description"
-		content="Find, save, and negotiate your contracts."
-	/></svelte:head
->
 <AppHeader />
 <main
 	class="home min-h-[calc(100dvh-var(--app-header-height))] bg-[#fafafa] px-3 py-4 sm:px-4 md:px-5 md:py-5"
@@ -208,17 +214,23 @@
 					</button>
 				{/if}
 			</div>
-			<a
-				href="/contracts/new"
-				class="flex h-9 shrink-0 items-center gap-1.5 rounded-button-lg bg-[#171717] px-3 text-[13px] font-normal text-white hover:bg-[#303030]"
-				><PlusIcon size={15} aria-hidden="true" />Add New</a
-			>
+			{#if viewer().templateReady}<a
+					href="/contracts/new"
+					class="flex h-9 shrink-0 items-center gap-1.5 rounded-button-lg bg-[#171717] px-3 text-[13px] font-normal text-white hover:bg-[#303030]"
+					><PlusIcon size={15} aria-hidden="true" />Add New</a
+				>
+			{:else}<button
+					disabled
+					title="Your company’s contract template is being prepared."
+					class="flex h-9 shrink-0 items-center gap-1.5 rounded-button-lg bg-[#171717] px-3 text-[13px] font-normal text-white opacity-40"
+					><PlusIcon size={15} aria-hidden="true" />Add New</button
+				>{/if}
 		</div>
 		<div class="mb-3 flex items-center gap-3">
 			<h1 class="text-sm font-medium">Contracts</h1>
-			{#if waiting}<span role="status" class="text-xs text-ink-muted">Loading…</span>{/if}
+			{#if waiting && cards.length}<LoadingWheel label="Refreshing contracts" />{/if}
 		</div>
-		{#if contracts?.error && cards.length}<p class="mb-3 text-xs text-ink-muted" role="status">
+		{#if listError && cards.length}<p class="mb-3 text-xs text-ink-muted" role="status">
 				We couldn’t refresh your contracts. Showing previous results.
 			</p>{/if}
 		{#if actionError}<p
@@ -227,7 +239,7 @@
 			>
 				{actionError}
 			</p>{/if}
-		{#if (!contracts || contracts.error) && cards.length === 0}
+		{#if (!contracts || listError) && cards.length === 0}
 			<div class="state" role="alert">
 				<p>We couldn’t load your contracts.</p>
 				<button
@@ -236,6 +248,8 @@
 					>Try again</button
 				>
 			</div>
+		{:else if waiting && cards.length === 0}
+			<div class="flex justify-center py-16"><LoadingWheel label="Loading contracts" /></div>
 		{:else if cards.length === 0 && !waiting && contracts?.status === 'Exhausted'}
 			<div class="state" role="status">
 				{#if query}<h2 class="text-[13px] font-medium">No contracts found</h2>
@@ -245,7 +259,9 @@
 					>
 				{:else}<h2 class="text-[13px] font-medium">No contracts yet</h2>
 					<p class="mt-2 text-[13px] text-ink-muted">
-						Select Add New to start your first contract.
+						{viewer().templateReady
+							? 'Select Add New to start your first contract.'
+							: 'Your company’s contract template is being prepared. You can invite colleagues from Team while you wait.'}
 					</p>{/if}
 			</div>
 		{:else if cards.length}
@@ -266,12 +282,11 @@
 				{/each}
 			</div>
 		{/if}
-		{#if contracts && contracts.status !== 'Exhausted'}<div class="mt-6 flex justify-center">
+		{#if contracts && (cards.length || contracts.status === 'CanLoadMore' || contracts.status === 'LoadingMore') && contracts.status !== 'Exhausted'}<div
+				class="mt-6 flex justify-center"
+			>
 				<button
-					disabled={waiting ||
-						Boolean(contracts.error) ||
-						settledQuery !== query ||
-						contracts.status === 'LoadingMore'}
+					disabled={waiting || listError || contracts.status === 'LoadingMore'}
 					onclick={() => contracts.loadMore(24)}
 					class="rounded-button-lg border border-[#e5e5e5] bg-white px-4 py-2 text-sm disabled:opacity-50"
 					>{contracts.status === 'LoadingMore' ? 'Loading…' : 'Load more'}</button

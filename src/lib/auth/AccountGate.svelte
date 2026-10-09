@@ -1,32 +1,39 @@
 <script lang="ts">
 	import { useAuth, useConvexClient, useQuery } from 'convex-svelte';
 	import { api } from '../../convex/_generated/api';
-	import Workspace from './Workspace.svelte';
-	import { setViewer, useViewerSession, type Viewer } from './viewer-session.svelte';
+	import { discardMembershipDrafts } from '$lib/contract/draft-recovery.svelte';
+	import { setCacheIdentity } from '$lib/contract/browser-storage';
+	import {
+		contractCacheResources,
+		releaseContractSnapshotCache
+	} from '$lib/contract/snapshot-cache';
+	import { setAccount, useViewerSession, type AccountViewer } from './viewer-session.svelte';
 	import { AccountPreparation } from './account-preparation';
 	import { ReadAttempt, waitForRead } from './attempt';
+	import { recordStartup } from './startup-perf';
 	import { untrack, onDestroy, type Snippet } from 'svelte';
 	let { children }: { children: Snippet } = $props();
 	const client = useConvexClient();
 	const auth = useAuth();
 	const session = useViewerSession();
+	session.registerResources(contractCacheResources);
 	const viewer = useQuery(api.profiles.viewer, () => (auth.isAuthenticated ? {} : 'skip'));
-	let retainedViewer = $state.raw<Viewer | undefined>();
+	let account = $state.raw<AccountViewer>();
+	setAccount(() => account);
 	const preparation = new AccountPreparation();
-	setViewer(() => retainedViewer!);
 	let error = $state('');
-	let admitted = $state(false);
 	let generation = -1;
-	let attempt = 0;
+	let epoch = 0;
 	let preparationAttempt: ReadAttempt | undefined;
 	let alive = true;
+	let recorded = false;
 	onDestroy(() => {
 		alive = false;
 		preparationAttempt?.abort();
-		attempt++;
+		epoch++;
 	});
 	async function initialize(transportGeneration: number) {
-		const current = ++attempt;
+		const current = ++epoch;
 		preparationAttempt?.abort();
 		const read = new ReadAttempt(15_000);
 		preparationAttempt = read;
@@ -35,7 +42,7 @@
 		try {
 			await waitForRead(client.mutation(api.profiles.initialize, {}), read.signal);
 		} catch (e) {
-			if (alive && current === attempt && session.transportGeneration === transportGeneration)
+			if (alive && current === epoch && session.transportGeneration === transportGeneration)
 				error = e instanceof Error ? e.message : 'Unable to initialize your account.';
 		} finally {
 			read.complete();
@@ -46,22 +53,39 @@
 		const nextGeneration = session.transportGeneration;
 		const data = viewer.data;
 		untrack(() => {
-			if (authenticated) {
+			if (authenticated)
 				void preparation.initialize(data, nextGeneration, () => initialize(nextGeneration));
-			}
 		});
 	});
 	$effect(() => {
 		const data = viewer.data;
 		const nextGeneration = session.transportGeneration;
 		const failure = (generation === nextGeneration ? error : '') || viewer.error?.message || '';
-		const ready = Boolean(data?.ready && !data.needsInitialization && !failure);
+		const ready = Boolean(data && !data.needsInitialization && !failure);
 		untrack(() => {
-			if (data) retainedViewer = data;
-			if (ready) admitted = true;
-			session.reportWorkspace(ready, failure);
+			if (data) {
+				if (
+					account?.profile.id !== data.profile.id ||
+					account?.membership?.id !== data.membership?.id
+				) {
+					releaseContractSnapshotCache();
+					setCacheIdentity(
+						data.membership
+							? { profileId: data.profile.id, membershipId: data.membership.id }
+							: null
+					);
+				}
+				if (account?.membership && account.membership.id !== data.membership?.id && session.userId)
+					discardMembershipDrafts(session.userId, account.membership.id);
+				account = data;
+			}
+			if (ready && !recorded) {
+				recordStartup('account-ready');
+				recorded = true;
+			}
+			session.reportAccount(ready, failure);
 		});
 	});
 </script>
 
-{#if admitted}<Workspace>{@render children()}</Workspace>{/if}
+{@render children()}

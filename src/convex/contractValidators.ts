@@ -1,11 +1,26 @@
 import { v } from 'convex/values';
 
 export const selections = v.record(v.id('playbookItems'), v.string());
+export const reviewStatus = v.union(
+	v.literal('pending'),
+	v.literal('approved'),
+	v.literal('rejected')
+);
+export const reviewDecision = v.union(v.literal('approved'), v.literal('rejected'));
+export const concessionReview = v.object({
+	concessionId: v.string(),
+	lifecycle: v.string(),
+	status: reviewStatus
+});
+export const concessionReviews = v.record(v.id('playbookItems'), concessionReview);
+export const selectionLifecycles = v.record(v.id('playbookItems'), v.string());
 // The item identity is resolved within this contract's immutable snapshot, even
 // when the corresponding live playbook item has been deleted.
 export const approvalSelection = v.object({
 	itemId: v.id('playbookItems'),
-	concessionPosition: v.number()
+	concessionPosition: v.number(),
+	lifecycle: v.optional(v.string()),
+	reviewStatus: v.optional(reviewStatus)
 });
 export const approvalRequest = v.object({
 	id: v.string(),
@@ -24,6 +39,8 @@ export const approvalRequest = v.object({
 	retryEligible: v.boolean()
 });
 export const storedApprovalRequest = approvalRequest.extend({
+	recipientEmail: v.string(),
+	companyId: v.id('company'),
 	contractId: v.id('savedContracts'),
 	sendJobId: v.id('_scheduled_functions'),
 	dispatchStarted: v.boolean(),

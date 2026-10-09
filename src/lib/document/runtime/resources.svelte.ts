@@ -1,5 +1,6 @@
 import { getContext, setContext, untrack } from 'svelte';
 import type { Snippet } from 'svelte';
+import type { ReviewTag, ReviewDecision, ReviewNavigation } from '$lib/contract/approval';
 import type { ContractChange, SourcePoint, SourceRange } from '$lib/playbook/model';
 import type { ContractRouteData } from '$lib/contract/saved';
 import type { ContractSourceInput } from './source.svelte';
@@ -11,6 +12,9 @@ import { sameSelection } from '$lib/playbook/model';
 import { type ConcessionSelection } from './types';
 
 export interface ViewerBindings {
+	reviewTags?: readonly ReviewTag[];
+	reviewNavigation?: ReviewNavigation;
+	onReviewDecision?: (tag: ReviewTag, status: ReviewDecision) => void;
 	panelContent: Snippet;
 	footerContent?: Snippet;
 	selectedConcessions: ConcessionSelection;
@@ -22,7 +26,10 @@ export interface ViewerBindings {
 	previewChanges?: readonly ContractChange[];
 	panelSource?: SourcePoint;
 	picking?: boolean;
+	/** Whether this document offers playbook navigation, independent of temporary readiness. */
 	allowPlaybookNavigation?: boolean;
+	/** Additional action guard; does not remove mounted button semantics or focus. */
+	playbookNavigationReady?: boolean;
 	onRemoveConcession: (itemId: string) => void;
 	onSelect: (itemId: string, annotationId: string) => boolean | void;
 }

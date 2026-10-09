@@ -9,6 +9,7 @@
 		page,
 		highlights = [],
 		interactive = true,
+		navigationCapable = false,
 		selectedAnnotationId,
 		canOpenPlaybookItems,
 		onAnnotationSelect
@@ -16,6 +17,7 @@
 		page: PaginatedPage;
 		highlights?: readonly HighlightRect[];
 		interactive?: boolean;
+		navigationCapable?: boolean;
 		selectedAnnotationId: string | null;
 		canOpenPlaybookItems: boolean;
 		onAnnotationSelect: (
@@ -37,6 +39,7 @@
 			<BlockFragment
 				{fragment}
 				{interactive}
+				{navigationCapable}
 				{selectedAnnotationId}
 				{canOpenPlaybookItems}
 				{onAnnotationSelect}

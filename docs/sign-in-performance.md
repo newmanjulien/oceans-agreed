@@ -1,6 +1,6 @@
 # Sign-in performance
 
-Updated on October 8, 2026. Application changes are implemented and verified locally. Production has not been deployed or measured.
+Updated on October 9, 2026. Application changes are implemented and verified locally. Production has not been deployed or measured. The measurements below were collected on October 8, before the route split described in [Account entry and workspace routes](account-routes.md).
 
 ## Resulting behavior
 
@@ -12,7 +12,7 @@ Submitting while Clerk is starting shows “Connecting…” and queues one subm
 
 Ordinary `/login` and `/join` requests bypass the server Clerk handshake and use `Cache-Control: private, no-store`. Clerk callback parameters still use its server handler. An anonymous root document request with no authentication artifacts redirects directly to `/login`. Cookie presence selects that route only; protected layouts and API handlers still verify authentication.
 
-The root now owns only Clerk readiness. Convex, workspace admission, session recovery, draft handling, and workspace cache ownership belong to the protected layout. Public authentication routes disable link preloading. Their initial JavaScript graph does not import the Convex client or workspace document/cache modules.
+The root owns Clerk readiness, startup preparation, and the persistent session controller. A lazy authenticated account host owns Convex, account preparation, and membership cache identity across entry and workspace routes. The root session retains cache cleanup across navigation; the membership-admitted workspace owns its chrome, document resources, and editors. Public authentication routes disable link preloading. Their initial static JavaScript graph does not import the Convex client or workspace document/cache modules; anonymous invitations also defer Convex through lazy resolution code. Code requests preload the authenticated account host and requested route without mounting them or starting queries. Direct protected loads start the same downloads while Clerk connects. Workspace, Home, and document destinations preload their corresponding dynamic modules; invitation and onboarding destinations avoid workspace imports.
 
 ## Local measurements
 
@@ -38,14 +38,14 @@ The Clerk development SDK can perform a later document reload during its browser
 | Gzip bytes                       |  76,494 |  60,933 |    20.34% |
 | Unique emitted files             |      19 |      16 |         3 |
 
-The [optimized manifest snapshot](performance/sign-in-optimized.json) walks unique static imports from the root layout and login page, currently generated client nodes `0` and `11`. Check generated route ordering if routes change. Gzip is summed per emitted file. Dynamic imports, the separate entry runtime, CSS, fonts, and the hosted Clerk SDK are excluded. This is a dependency-graph comparison, not total browser transfer or production latency.
+The [optimized manifest snapshot](performance/sign-in-optimized.json) walks unique static imports from the root layout and login page, generated client nodes `0` and `11` in that October 8 build. The current route graph also includes the entry layout, and route ordering has changed; do not use those historical node IDs for a new measurement. Gzip is summed per emitted file. Dynamic imports, the separate entry runtime, CSS, fonts, and the hosted Clerk SDK are excluded. This is a dependency-graph comparison, not total browser transfer or production latency.
 
 ## Verification
 
 `npm run verify` passed: all 24 existing performance tests, Svelte/type checking with zero errors or warnings, and the production build. Existing saving, scheduling, caching, creation, and startup assertions were preserved; no tests were added or expanded for this change.
 
-Review fixes make a redirect back to sign-in fail the navigation attempt so the existing retry can start a fresh request. Losing the session cancels pending work and clears the opening state. Empty invitation parameters follow ordinary email signup. The protected session controller no longer retains sign-in navigation methods, flags, or retry branches. These fixes passed `npm run verify` and source review; their component behavior has not been checked in a browser.
+Review fixes make a redirect back to sign-in fail the navigation attempt so the existing retry can start a fresh request. Losing the session cancels pending work and clears the opening state. Empty invitation parameters follow ordinary email signup. The persistent root session controller does not retain sign-in navigation methods, flags, or retry branches. These fixes passed `npm run verify` and source review; their component behavior has not been checked in a browser.
 
 Temporary Chrome DevTools Protocol checks verified pre-hydration typing, delayed-SDK submission exactly once, cancellation when switching flows, and an SDK failure followed by explicit retry without automatic email submission. Live development Clerk checks verified email/code login, email/code signup, existing-session restoration, safe local return destinations, rejection of external return destinations, ordinary logout, and one invalid invitation-ticket attempt with an inline error. No uncaught exceptions were observed. No browser framework or committed browser automation was added.
 
-Valid invitation acceptance, session expiry with pending edits, account switching, and logout cancellation/discard were reviewed only where affected; they have not been rehearsed in the browser for this change. The existing performance suite checks its current automated guarantees and does not directly cover all new readiness and cancellation paths.
+Current route-level browser checks, including account switching, are recorded in [Account entry and workspace routes](account-routes.md). Valid invitation acceptance, session expiry with pending edits, and logout cancellation/discard have not been rehearsed for this refactor. The existing performance suite checks its current automated guarantees and does not directly cover all new readiness and cancellation paths.

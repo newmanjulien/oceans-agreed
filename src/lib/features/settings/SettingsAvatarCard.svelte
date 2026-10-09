@@ -61,7 +61,7 @@
 			class="sr-only"
 			onchange={handleFileChange}
 		/>
-		<p class="min-h-5 text-[0.72rem] leading-5 {errorText ? 'text-red-600' : 'text-stone-500'}">
+		<p class="min-h-5 text-[0.72rem] leading-5 {errorText ? 'text-danger' : 'text-stone-500'}">
 			{errorText ?? (uploading ? 'Uploading...' : '')}
 		</p>
 	</div>

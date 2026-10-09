@@ -51,8 +51,11 @@ npm run seed:verify
 npx convex dev
 ```
 
-For a fresh development deployment, run `npm run convex:seed` and `npm run dev`.
 Configure `PUBLIC_CONVEX_URL` and the Clerk development keys in `.env.local`.
+For a fresh development deployment, run `npm run dev`, sign up, and create a
+company. Copy its ID from the Convex dashboard, then run
+`npm run convex:seed -- --company-id COMPANY_ID`. Each company starts without a
+template; contract creation becomes available after its initial scoped import.
 Follow [Clerk setup and rollout](docs/clerk-auth.md) before starting `convex dev`:
 the backend needs the matching JWT issuer. Local verification and production builds
 can run before Clerk is configured; the app shows a setup screen until keys exist.
@@ -61,9 +64,9 @@ The canonical bootstrap data is `data/convex`: 113 immutable blocks and
 The seed command refuses to overwrite edited runtime records and resumes an
 interrupted items-first import. It is not a migration tool.
 
-Use a fresh deployment for this schema, or explicitly migrate existing data
-before pushing it. Existing records and scheduled lifecycle jobs must be handled
-by that migration.
+This schema uses required company scope and personal roles. Reset development data
+before deploying it over legacy records, then recreate the company through normal
+signup and reseed it. Follow [the fresh reset runbook](docs/private-companies-rollout.md#fresh-development-reset).
 
 ## Approval request email (preliminary)
 
@@ -87,11 +90,12 @@ with `npx convex env set NAME value` (not as public SvelteKit environment variab
 
 | Variable            | Value                                                        |
 | ------------------- | ------------------------------------------------------------ |
-| `APPROVAL_EMAIL`    | `ben@oceanstalent.com`                                       |
 | `SMTP_USER`         | `julien.newman@gmail.com`                                    |
 | `SMTP_APP_PASSWORD` | Gmail app password for that account; setup deferred          |
 | `APP_URL`           | Live app origin, without a query or fragment; value deferred |
 
+Set each company’s approval recipient in Settings. Requests capture that recipient
+when queued. Invitations also use these SMTP credentials and `APP_URL`.
 Nodemailer uses `smtp.gmail.com:465` with TLS. Missing variables are listed in the
 request's failure feedback. A durable marker records dispatch immediately before
 SMTP. Recovery checks the scheduled action every minute and blocks all further
@@ -111,8 +115,8 @@ does not schedule jobs or restart the uncertainty detection time. Feedback expla
 that a retry may deliver a duplicate email; the delay does not guarantee uniqueness.
 Only status persistence is retried automatically, never SMTP. Success blocks
 duplicates for identical selections; changed selections allow a new request after
-the original job ends. Deletion atomically removes the request, snapshot, and
-contract, canceling the send job only while pending or running. Missing or terminal
+the original job ends. Deletion atomically removes the request and contract, retaining
+the shared immutable template version and canceling the send job only while pending or running. Missing or terminal
 jobs do not block deletion; an email already dispatched cannot be recalled.
 Completion and recovery match request IDs so old jobs cannot overwrite newer requests.
 
@@ -145,8 +149,8 @@ npm run format:check
 npm run build
 ```
 
-`npm run db:audit -- https://YOUR-DEPLOYMENT.convex.cloud` validates a configured
-live deployment without comparing deployment-specific IDs to seed IDs. Add `--seed`
+`npm run db:audit -- --company-id COMPANY_ID` validates one company on the
+configured deployment without comparing deployment-specific IDs to seed IDs. Add `--seed`
 to require an exact business-data match to the local seed. The local
 verifier uses deterministic row identities only within verification; no second
 business identity is stored. It compares all 58 frozen compositor states,
@@ -156,13 +160,16 @@ server-rendered provenance attributes; see the [reference policy](docs/overlay-r
 Contract creation, immutable publication, development measurements, and the staged
 rollout are documented in [the creation report](docs/contract-creation-performance.md).
 
-Agreed uses open email-code signup, one shared company, and `rep` / `admin`
-profiles. Everyone can edit their own name and avatar in Settings; only admins
-can edit the shared company name and avatar. Roles are assigned through a trusted
-backend operation. Contracts retain their original creator; deleting a Clerk
-account immediately blocks its access and hides that creator's contracts when the
-signed webhook commits, then removes their data in resumable batches. See
-[authentication configuration and rehearsal](docs/clerk-auth.md).
+Agreed uses open verified email signup and private companies. Each account creates a
+company, accepts an invitation, or waits for a colleague. There is no company
+discovery or email-domain autojoin. Each user chooses Rep or Admin for themselves
+in Settings; Admin grants company administration immediately. New profiles start
+as Rep, company creators become Admin and owner, and invitations preserve personal
+roles. Ownership is independent: owners can choose Rep and still transfer ownership.
+Admins invite/remove colleagues and edit company settings. Contracts stay with the company when a colleague leaves or
+deletes their account, with former-colleague attribution where needed. See
+[authentication configuration](docs/clerk-auth.md) and
+[the schema and rollout runbook](docs/private-companies-rollout.md).
 
 See [workspace ownership](docs/persistent-workspace.md),
 [rendering](docs/overlay-rendering.md), [performance](docs/rendering-snappiness.md),
@@ -175,11 +182,9 @@ concession draft. This choice only routes local creation; every saved box expose
 the same editing capabilities. The staged concession itself determines which
 creation steps are shown, so no separate mode is serialized or sent to the backend.
 
-The storage schema still accepts the obsolete optional `authoringMode` field on
-existing records. It is ignored when editing and removed by the next successful
-full-item save. New records omit it. No reseeding is needed. Optional revision
-metadata also remains compatible with existing records; deploy the updated Convex
-schema and mutations together with the frontend.
+Creation mode is absent from live records and immutable snapshots. Optional revision
+metadata remains compatible with existing records; deploy the Convex schema and
+mutations together with the frontend.
 
 Cold-start implementation, rollback flags, recorded evidence, and outstanding production
 measurement gates are documented in [the performance report](docs/cold-start-performance.md).
@@ -200,5 +205,5 @@ old provision rules. `seed:verify` requires that reconciliation to pass.
 Concessions retain optional `detail` and `after` copy; source text retains optional
 bold/italic `marks`. These fields are validated, displayed, and preserved by edits.
 Read [the reconciliation and cutover report](docs/production-data-reconciliation.md)
-before any development rehearsal or production cutover. The development seed guard
-is unchanged; it deliberately cannot load production or overwrite an older seed.
+before any development rehearsal or production cutover. The seed command requires an explicit company and matching development/local
+target; it cannot load production or overwrite existing edited content.

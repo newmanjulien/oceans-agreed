@@ -197,7 +197,7 @@ export class DocumentHighlightController {
 				const number = Number(page.dataset.pageNumber);
 				if (record.type === 'attributes') {
 					if (record.oldValue === element?.getAttribute(record.attributeName!)) continue;
-					if (record.attributeName === 'aria-pressed') {
+					if (record.attributeName === 'data-annotation-selected') {
 						this.#paintDirty.add(number);
 						continue;
 					}
@@ -609,7 +609,7 @@ export class DocumentHighlightController {
 					attributes: true,
 					attributeOldValue: true,
 					attributeFilter: [
-						'aria-pressed',
+						'data-annotation-selected',
 						'class',
 						'data-revision',
 						'data-annotation-id',

@@ -5,7 +5,11 @@
 	import { helpContent, type HelpVariant } from './help-content';
 	import { isHelpHidden, setHelpHidden } from './help-storage';
 
-	let { variant, onClose }: { variant: HelpVariant; onClose: () => void } = $props();
+	let {
+		variant,
+		isAdmin = false,
+		onClose
+	}: { variant: HelpVariant; isAdmin?: boolean; onClose: () => void } = $props();
 	const content = $derived(helpContent[variant]);
 
 	let hideHelp = $state(false);
@@ -49,13 +53,14 @@
 											class="rounded-[3px] [box-decoration-break:clone] [-webkit-box-decoration-break:clone]"
 											style:background={highlight.color === 'blue'
 												? 'var(--document-highlight-selection, #d2e3fc)'
-												: 'var(--document-highlight-trigger, rgba(34, 197, 94, 0.16))'}
+												: 'var(--document-highlight-trigger, color-mix(in srgb, var(--color-success) 16%, transparent))'}
 										>
 											{highlight.text}
 										</span>{step.description.slice(highlightStart + highlight.text.length)}
 									{:else}
 										{step.description}
 									{/if}
+									{#if isAdmin && 'adminNote' in step}{' '}{step.adminNote}{/if}
 								</p>
 							</div>
 						</li>

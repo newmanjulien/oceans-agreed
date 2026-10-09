@@ -38,7 +38,7 @@
 					: signingOut
 						? 'Logging out'
 						: authFailure
-							? 'Unable to open your workspace'
+							? 'Unable to connect your account'
 							: controller.error
 								? 'Please try again'
 								: 'Still connecting'}

@@ -136,7 +136,9 @@ export function resolveAnnotationAnchor(
 ): AnnotationAnchor | undefined {
 	if (!annotationId) return;
 	const point = preference?.point ?? fallbackPoint;
-	const position = point ? pointPosition(index, point) : undefined;
+	// A captured point may outlive its source unit or the unit's previous length.
+	const unit = point ? index.byKey.get(point.sourceKey) : undefined;
+	const position = unit && point ? unit.position + Math.min(point.offset, unit.length) : undefined;
 	let best: (AnnotationAnchor & { rank: number[] }) | undefined;
 	for (const owner of registry.forAnnotation(annotationId)) {
 		for (const token of owner.querySelectorAll<HTMLElement>(

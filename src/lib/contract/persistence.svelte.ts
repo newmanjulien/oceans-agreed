@@ -1,4 +1,5 @@
 import { sameSelection } from '$lib/playbook/model';
+import { selectionLifecycles } from './approval';
 import { MAX_SELECTED_CONCESSIONS } from './selection-limits';
 import {
 	saveError,
@@ -12,6 +13,7 @@ import type { ContractDraft } from './draft-recovery.svelte';
 export type ContractSaveRequest = {
 	id: Id<'savedContracts'>;
 	selectedConcessions: SavedSelections;
+	selectionLifecycles?: Record<string, string>;
 	expectedRevision: number;
 	operationId: string;
 };
@@ -20,6 +22,7 @@ export type ContractSaveRequest = {
 export class ContractPersistence {
 	confirmed: ContractState;
 	choices = $state.raw<SavedSelections>({});
+	lifecycles = $state.raw<Record<string, string>>({});
 	request = $state.raw<ContractSaveRequest | null>(null);
 	error = $state<string | null>(null);
 	selectionLimitError = $state<string | null>(null);
@@ -33,19 +36,54 @@ export class ContractPersistence {
 	private loadingLatest = false;
 	private transportGeneration = 0;
 	private recovery: ContractDraft | null;
+	private confirmedLifecycles = $derived.by(() =>
+		selectionLifecycles(this.confirmed, this.required)
+	);
 
 	constructor(
 		private id: Id<'savedContracts'>,
 		initial: ContractState,
 		private save: (request: ContractSaveRequest) => Promise<ContractSaveResult>,
 		private checkpoint: (draft: ContractDraft | null) => void = () => {},
-		recovery: ContractDraft | null = null
+		recovery: ContractDraft | null = null,
+		private required: ReadonlySet<string> = new Set()
 	) {
 		this.confirmed = $state.raw(initial);
 		this.choices = { ...initial.selectedConcessions };
+		this.lifecycles = selectionLifecycles(initial, this.required);
 		this.recovery = recovery;
 		this.recoveryPending = !!recovery;
-		if (recovery) this.choices = { ...recovery.choices };
+		if (recovery) this.restoreChoices(recovery);
+	}
+	private restoreChoices(draft: ContractDraft) {
+		this.choices = { ...draft.choices };
+		const lifecycles = selectionLifecycles(
+			{ ...draft.base, selectedConcessions: draft.choices },
+			this.required
+		);
+		// Older or incomplete checkpoints may omit applications or retain removed ones.
+		// Normalize local intent without changing an interrupted request's immutable arguments.
+		for (const id of Object.keys(lifecycles)) {
+			const itemId = id as Id<'playbookItems'>;
+			let lifecycle = draft.lifecycles?.[id];
+			const request = draft.request;
+			if (!lifecycle && request?.selectedConcessions[itemId] === this.choices[itemId]) {
+				// Match the server's fallback for an interrupted pre-lifecycle request.
+				lifecycle =
+					request.selectionLifecycles?.[id] ??
+					(draft.base.selectedConcessions[itemId] === this.choices[itemId]
+						? lifecycles[id]
+						: `${request.operationId}:${id}`);
+			}
+			if (lifecycle?.trim() && lifecycle.length <= 300) lifecycles[id] = lifecycle;
+		}
+		this.lifecycles = lifecycles;
+	}
+	private useConfirmedChoices() {
+		if (!sameSelection(this.choices, this.confirmed.selectedConcessions))
+			this.choices = { ...this.confirmed.selectedConcessions };
+		const lifecycles = this.confirmedLifecycles;
+		if (!sameSelection(this.lifecycles, lifecycles)) this.lifecycles = lifecycles;
 	}
 
 	get pending() {
@@ -53,7 +91,8 @@ export class ContractPersistence {
 			this.recoveryPending ||
 			this.conflict ||
 			Boolean(this.request) ||
-			!sameSelection(this.choices, this.confirmed.selectedConcessions)
+			!sameSelection(this.choices, this.confirmed.selectedConcessions) ||
+			(this.required.size > 0 && !sameSelection(this.lifecycles, this.confirmedLifecycles))
 		);
 	}
 	get editable() {
@@ -78,6 +117,7 @@ export class ContractPersistence {
 						version: 1,
 						base: this.confirmed,
 						choices: this.choices,
+						lifecycles: this.lifecycles,
 						request: this.request,
 						conflict: this.conflict
 					}
@@ -97,6 +137,12 @@ export class ContractPersistence {
 		}
 		this.selectionLimitError = null;
 		if (sameSelection(next, this.choices)) return;
+		if (this.required.has(itemId)) {
+			const lives = { ...this.lifecycles };
+			if (next[itemId]) lives[itemId] = crypto.randomUUID();
+			else delete lives[itemId];
+			this.lifecycles = lives;
+		}
 		this.choices = next;
 		this.record();
 		this.start();
@@ -120,7 +166,7 @@ export class ContractPersistence {
 		const own = Boolean(this.request && next.lastOperationId === this.request.operationId);
 		if (next.revision > this.confirmed.revision && pending && !own) this.conflict = true;
 		this.confirmed = next;
-		if (!pending && !this.conflict) this.choices = { ...next.selectedConcessions };
+		if (!pending && !this.conflict) this.useConfirmedChoices();
 		// A subscription can confirm an ambiguous failed response. Do not send a duplicate.
 		if (own && !this.running && !this.conflict) {
 			this.request = null;
@@ -134,7 +180,7 @@ export class ContractPersistence {
 		this.recovery = null;
 		this.recoveryPending = false;
 		this.confirmed = next;
-		this.choices = { ...draft.choices };
+		this.restoreChoices(draft);
 		this.request = draft.request;
 		this.conflict = draft.conflict;
 		if (draft.request && next.lastOperationId === draft.request.operationId) {
@@ -146,7 +192,8 @@ export class ContractPersistence {
 			if (next.revision !== draft.request.expectedRevision) this.conflict = true;
 		} else if (
 			next.revision !== draft.base.revision &&
-			!sameSelection(this.choices, next.selectedConcessions)
+			(!sameSelection(this.choices, next.selectedConcessions) ||
+				!sameSelection(this.lifecycles, selectionLifecycles(next, this.required)))
 		)
 			this.conflict = true;
 		this.record();
@@ -181,6 +228,7 @@ export class ContractPersistence {
 			this.request = {
 				id: this.id,
 				selectedConcessions: { ...this.choices },
+				...(this.required.size ? { selectionLifecycles: { ...this.lifecycles } } : {}),
 				expectedRevision: this.confirmed.revision,
 				operationId: crypto.randomUUID()
 			};
@@ -256,7 +304,7 @@ export class ContractPersistence {
 			this.error = null;
 			this.conflict = false;
 			this.selectionLimitError = null;
-			this.choices = { ...this.confirmed.selectedConcessions };
+			this.useConfirmedChoices();
 			this.record();
 			return true;
 		} finally {
@@ -277,6 +325,7 @@ export class ContractPersistence {
 				version: 1,
 				base: this.confirmed,
 				choices: this.choices,
+				lifecycles: this.lifecycles,
 				request: this.request,
 				conflict: this.conflict
 			};
@@ -291,7 +340,7 @@ export class ContractPersistence {
 		this.request = null;
 		this.error = null;
 		this.conflict = false;
-		this.choices = { ...this.confirmed.selectedConcessions };
+		this.useConfirmedChoices();
 		this.checkpoint(null);
 	}
 

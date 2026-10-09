@@ -1,44 +1,27 @@
 <script lang="ts">
-	import { browser } from '$app/environment';
 	import { useClerkContext } from 'svelte-clerk';
-	import StartupSurface from './StartupSurface.svelte';
 	import SessionStatus from './SessionStatus.svelte';
 	import { SessionController } from './session-controller.svelte';
-	import {
-		cancelPendingContractSnapshots,
-		releaseContractSnapshotCache
-	} from '$lib/contract/snapshot-cache';
-	import { setCacheIdentity } from '$lib/contract/browser-storage';
-	import { discardUserDrafts } from '$lib/contract/draft-recovery.svelte';
-	import { setViewerSession } from './viewer-session.svelte';
-	import { localReturn } from './navigation';
+	import { setViewerSession, type SessionResources } from './viewer-session.svelte';
+	import { loginDestination } from './navigation';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onDestroy, onMount, untrack, type Snippet } from 'svelte';
 	let { children }: { children: Snippet } = $props();
 	const clerk = useClerkContext();
 	let alive = true;
+	const resources = new Set<SessionResources>();
 	const controller = new SessionController({
 		signOut: async () => {
 			if (!clerk.clerk) throw new Error('Authentication is unavailable.');
 			await clerk.clerk.signOut(() => {});
 		},
-		cancelReads: cancelPendingContractSnapshots,
-		clear: () => {
-			releaseContractSnapshotCache();
-			setCacheIdentity(null);
-		},
+		cancelReads: () => resources.forEach((resource) => resource.cancelReads()),
+		clear: () => resources.forEach((resource) => resource.clear()),
 		login: async (recover) => {
-			const destination = recover
-				? localReturn(page.url.pathname + page.url.search + page.url.hash)
-				: '/';
-			await goto(
-				destination === '/' ? '/login' : `/login?returnTo=${encodeURIComponent(destination)}`,
-				{ invalidateAll: true }
-			);
+			await goto(loginDestination(page.url, recover), { invalidateAll: true });
 		}
 	});
-	const starting = $derived(!controller.admitted);
 	setViewerSession({
 		get closing() {
 			return controller.closing;
@@ -55,6 +38,9 @@
 		get error() {
 			return controller.error;
 		},
+		get authenticationError() {
+			return controller.authenticationError;
+		},
 		get delayed() {
 			return controller.delayed;
 		},
@@ -68,9 +54,11 @@
 			return controller.transportGeneration;
 		},
 		registerEditor: (editor) => controller.registerEditor(editor),
+		registerResources: (resource) => {
+			resources.add(resource);
+		},
 		reportAuth: (loading, authenticated) => controller.reportAuth(loading, authenticated),
-		reportWorkspace: (ready, error) => controller.reportWorkspace(ready, error),
-		reportDestination: (ready, error) => controller.reportDestination(ready, error),
+		reportAccount: (ready, error) => controller.reportAccount(ready, error),
 		retryAuth: () => controller.retryAuth(),
 		cancelSignOut: () => controller.cancelSignOut(),
 		discardAndSignOut: () => controller.discardAndSignOut(),
@@ -78,8 +66,11 @@
 		returnToLogin: () => controller.returnToLogin(),
 		reset: () => controller.reset(),
 		signOut: () => controller.signOut(),
+		exitCompany: (action, discard) => controller.exitCompany(action, discard),
 		completeAccountDeletion: ({ sessionId, userId }) => {
-			discardUserDrafts(userId);
+			void import('$lib/contract/draft-recovery.svelte').then(({ discardUserDrafts }) =>
+				discardUserDrafts(userId)
+			);
 			if (
 				!alive ||
 				(clerk.session && clerk.session.id !== sessionId) ||
@@ -90,7 +81,6 @@
 		}
 	});
 	let identity: string | null | undefined;
-	let cacheUser: string | null | undefined;
 	$effect(() => {
 		const loaded = clerk.isLoaded;
 		const sessionId = clerk.auth.sessionId ?? clerk.session?.id ?? null;
@@ -98,27 +88,19 @@
 		untrack(() => {
 			if (!loaded) return;
 			const initial = identity === undefined;
-			if (identity !== sessionId || cacheUser !== userId) {
-				releaseContractSnapshotCache();
-				setCacheIdentity(userId);
-				identity = sessionId;
-				cacheUser = userId;
-			}
+			identity = sessionId;
 			controller.identity(sessionId, userId, loaded);
-			if (initial && !sessionId) controller.reset(true);
+			if (initial && !sessionId && !['/login', '/join', '/invitation'].includes(page.url.pathname))
+				controller.reset(true);
 		});
 	});
 	onMount(() => controller.start());
 	onDestroy(() => {
 		alive = false;
 		controller.destroy();
-		if (browser) {
-			releaseContractSnapshotCache();
-			setCacheIdentity(null);
-		}
+		resources.forEach((resource) => resource.clear());
 	});
 </script>
 
-<div hidden={starting} inert={starting}>{@render children()}</div>
-{#if starting}<StartupSurface {controller} />{/if}
+{@render children()}
 <SessionStatus {controller} />

@@ -1,13 +1,21 @@
 <script lang="ts">
 	import '../app.css';
 	import { env } from '$env/dynamic/public';
+	import AuthBridge from '$lib/auth/AuthBridge.svelte';
+	import AccountSession from '$lib/auth/AccountSession.svelte';
 	import ClerkSessionProvider from '$lib/auth/ClerkSessionProvider.svelte';
+	import { setStartupPreparation } from '$lib/auth/startup-preparation';
+	import { onDestroy } from 'svelte';
 	let { children } = $props();
+	const preparation = setStartupPreparation();
+	onDestroy(() => preparation.cancel());
 </script>
+
+<svelte:head><title>Agreed</title></svelte:head>
 
 {#if env.PUBLIC_CLERK_PUBLISHABLE_KEY && env.PUBLIC_CONVEX_URL}
 	<ClerkSessionProvider publishableKey={env.PUBLIC_CLERK_PUBLISHABLE_KEY}>
-		{@render children()}
+		<AuthBridge><AccountSession>{@render children()}</AccountSession></AuthBridge>
 	</ClerkSessionProvider>
 {:else}
 	<main class="grid min-h-dvh place-content-center bg-white p-8 text-center">

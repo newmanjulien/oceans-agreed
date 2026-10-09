@@ -1,4 +1,9 @@
-import { requireProfile, accessibleContract } from './auth';
+import { requireMembership, accessibleContract, scopedOperation } from './auth';
+import {
+	approvalCoversPending,
+	legacyLifecycle,
+	reviewStatus as currentReviewStatus
+} from '../lib/contract/approval';
 import { ConvexError, v, type Infer } from 'convex/values';
 import { internal } from './_generated/api';
 import {
@@ -10,11 +15,13 @@ import {
 	type QueryCtx
 } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
-import { approvalRequest, approvalSelection } from './contractValidators';
-import { readSnapshot, readSnapshotItem } from './templates';
-import { CompiledContract } from '../lib/contract/compiled-contract';
-import { activeConflicts } from '../lib/playbook/selection-conflicts';
-import { toDocumentOverlay } from '../lib/playbook/document-overlay';
+import {
+	approvalRequest,
+	approvalSelection,
+	reviewStatus,
+	reviewDecision
+} from './contractValidators';
+import { snapshotReader, readVersionItem } from './templates';
 
 const RECOVERY_INTERVAL = 60_000;
 const UNCERTAIN_COOLDOWN = 10 * 60_000;
@@ -56,78 +63,82 @@ async function requestForClient(ctx: QueryCtx, request: Request) {
 }
 
 export const latest = query({
-	args: { id: v.id('savedContracts') },
+	args: { membershipId: v.id('memberships'), id: v.id('savedContracts') },
 	returns: v.union(approvalRequest, v.null()),
-	handler: async (ctx, { id }) => {
-		await requireProfile(ctx);
-		if (!(await accessibleContract(ctx, await ctx.db.get('savedContracts', id)))) return null;
+	handler: async (ctx, { id, membershipId }) => {
+		const access = await requireMembership(ctx, membershipId);
+		if (!accessibleContract(await ctx.db.get('savedContracts', id), access)) return null;
 		const request = await latestFor(ctx, id);
 		return request ? requestForClient(ctx, request) : null;
 	}
 });
 
 export const request = mutation({
-	args: { id: v.id('savedContracts'), expectedRevision: v.number() },
+	args: {
+		membershipId: v.id('memberships'),
+		id: v.id('savedContracts'),
+		expectedRevision: v.number()
+	},
 	returns: approvalRequest,
-	handler: async (ctx, { id, expectedRevision }): Promise<Infer<typeof approvalRequest>> => {
-		await requireProfile(ctx);
+	handler: async (
+		ctx,
+		{ id, membershipId, expectedRevision }
+	): Promise<Infer<typeof approvalRequest>> => {
+		const access = await requireMembership(ctx, membershipId);
 		if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
 			throw new ConvexError('Invalid contract revision.');
-		const contract = await accessibleContract(ctx, await ctx.db.get('savedContracts', id));
+		const contract = accessibleContract(await ctx.db.get('savedContracts', id), access);
 		if (!contract) throw new ConvexError('This contract was deleted.');
 		if ((contract.revision ?? 0) !== expectedRevision)
 			throw new ConvexError(
 				'This contract changed. Wait for the latest saved version before requesting approval.'
 			);
-		const snapshot = await readSnapshot(ctx, contract);
-		const selectedConcessions: Infer<typeof approvalSelection>[] = [];
-		let approvalNeeded = false;
-		for (const item of snapshot.items) {
-			const concessionPosition = item.concessions.findIndex(
-				(c) => c.id === contract.selectedConcessions[item._id]
-			);
-			if (concessionPosition < 0) continue;
-			selectedConcessions.push({ itemId: item._id, concessionPosition });
-			approvalNeeded ||= Boolean(item.instructions?.changesNeedApproval?.trim());
-		}
-		if (selectedConcessions.length !== Object.keys(contract.selectedConcessions).length)
-			throw new ConvexError('A selected concession does not belong to this contract.');
-		if (!approvalNeeded) throw new ConvexError('These concessions do not require approval.');
-		if (!contract.companyName.trim()) throw new ConvexError('Enter a buyer company name.');
-		try {
-			const compiled = new CompiledContract(snapshot.blocks);
-			if (
-				activeConflicts(
-					compiled.index,
-					snapshot.items.map(toDocumentOverlay),
-					contract.selectedConcessions
-				).length
-			)
-				throw new ConvexError('Remove conflicting concessions before requesting approval.');
-		} catch (error) {
-			if (error instanceof ConvexError) throw error;
-			throw new ConvexError('This contract snapshot has errors. Approval could not be requested.');
-		}
 		const previous = await latestFor(ctx, id);
-		if (previous) {
-			const sameSelections =
-				previous.selectedConcessions.length === selectedConcessions.length &&
-				previous.selectedConcessions.every(
-					(selection, i) =>
-						selection.itemId === selectedConcessions[i].itemId &&
-						selection.concessionPosition === selectedConcessions[i].concessionPosition
-				);
-			// Block the entire contract while unresolved, including changed selections.
-			if (
-				previous.status === 'sending' ||
-				(previous.status === 'sent' &&
-					previous.companyName === contract.companyName &&
-					sameSelections) ||
+		// Unresolved delivery blocks the entire contract, even if selections changed.
+		const activeJob = previous ? await jobActive(ctx, previous) : false;
+		if (
+			previous &&
+			(previous.status === 'sending' ||
 				(previous.status === 'uncertain' && !previous.retryEligible) ||
-				(await jobActive(ctx, previous))
-			)
-				return requestForClient(ctx, previous);
-		}
+				activeJob)
+		)
+			return publicRequest({
+				...previous,
+				retryEligible: (previous.status === 'failed' || previous.retryEligible) && !activeJob
+			});
+		const reader = await snapshotReader(ctx, contract);
+		const items = await reader.selectedItems(contract.selectedConcessions);
+		const selectedConcessions = items.map((item) => {
+			const concessionId = contract.selectedConcessions[item._id];
+			const review = contract.reviews?.[item._id];
+			const lifecycle =
+				review?.concessionId === concessionId
+					? review.lifecycle
+					: legacyLifecycle(item._id, concessionId);
+			return {
+				itemId: item._id,
+				...(item.instructions?.changesNeedApproval?.trim()
+					? {
+							lifecycle,
+							reviewStatus: currentReviewStatus(contract, item._id, concessionId, lifecycle)
+						}
+					: {}),
+				concessionPosition: item.concessions.findIndex((c) => c.id === concessionId)
+			};
+		});
+		const pending = selectedConcessions.flatMap((s) =>
+			s.reviewStatus === 'pending' && s.lifecycle !== undefined
+				? [{ ...s, concessionId: contract.selectedConcessions[s.itemId], lifecycle: s.lifecycle }]
+				: []
+		);
+		if (!pending.length) throw new ConvexError('There are no concessions waiting for approval.');
+		if (!contract.companyName.trim()) throw new ConvexError('Enter a buyer company name.');
+		if (previous?.status === 'sent' && approvalCoversPending(pending, previous.selectedConcessions))
+			return requestForClient(ctx, previous);
+
+		const recipientEmail = access.company.approvalEmail;
+		if (!recipientEmail)
+			throw new ConvexError('Ask your company admin to configure an approval email in Settings.');
 		const requestedAt = Date.now();
 		const requestId = `${requestedAt}-${Math.random().toString(36).slice(2)}`;
 		const args = { id, requestId };
@@ -135,6 +146,8 @@ export const request = mutation({
 		await ctx.scheduler.runAfter(RECOVERY_INTERVAL, internal.approvals.recover, args);
 		const next = {
 			id: requestId,
+			recipientEmail,
+			companyId: access.companyId,
 			contractId: id,
 			companyName: contract.companyName,
 			selectedConcessions,
@@ -152,37 +165,56 @@ export const request = mutation({
 
 export const forSend = internalQuery({
 	args: requestArgs,
-	returns: v.union(v.object({ companyName: v.string(), selectionCount: v.number() }), v.null()),
+	returns: v.union(
+		v.object({
+			companyName: v.string(),
+			selectedConcessions: v.array(approvalSelection),
+			templateVersionId: v.id('templateVersions'),
+			recipientEmail: v.string()
+		}),
+		v.null()
+	),
 	handler: async (ctx, { id, requestId }) => {
 		const request = await latestFor(ctx, id);
 		if (request?.id !== requestId || request.status !== 'sending' || request.dispatchStarted)
 			return null;
-		if (!(await accessibleContract(ctx, await ctx.db.get('savedContracts', id)))) return null;
-		return { companyName: request.companyName, selectionCount: request.selectedConcessions.length };
+		const contract = await ctx.db.get('savedContracts', id);
+		if (!contract || contract.companyId !== request.companyId) return null;
+		await snapshotReader(ctx, contract);
+		return {
+			companyName: request.companyName,
+			selectedConcessions: request.selectedConcessions,
+			templateVersionId: contract.templateVersionId,
+			recipientEmail: request.recipientEmail
+		};
 	}
 });
 
 export const descriptions = internalQuery({
-	args: { ...requestArgs, offset: v.number() },
-	returns: v.union(
-		v.array(v.object({ description: v.string(), requiresApproval: v.boolean() })),
-		v.null()
+	args: {
+		templateVersionId: v.id('templateVersions'),
+		selectedConcessions: v.array(approvalSelection)
+	},
+	returns: v.array(
+		v.object({
+			description: v.string(),
+			requiresApproval: v.boolean(),
+			reviewStatus: v.optional(reviewStatus)
+		})
 	),
-	handler: async (ctx, { id, requestId, offset }) => {
-		if (!Number.isSafeInteger(offset) || offset < 0)
-			throw new ConvexError('Invalid selection offset.');
-		const request = await latestFor(ctx, id);
-		if (request?.id !== requestId || request.status !== 'sending' || request.dispatchStarted)
-			return null;
-		const contract = await accessibleContract(ctx, await ctx.db.get('savedContracts', id));
-		if (!contract) return null;
+	handler: async (ctx, { templateVersionId, selectedConcessions }) => {
+		if (selectedConcessions.length > 4)
+			throw new ConvexError('Too many descriptions in one batch.');
+		// forSend validates the immutable parent once. startDispatch rechecks the active
+		// request after all batches, so these reads need only the selected children.
 		return Promise.all(
-			request.selectedConcessions.slice(offset, offset + 4).map(async (selection) => {
-				const item = await readSnapshotItem(ctx, contract, selection.itemId);
+			selectedConcessions.map(async (selection) => {
+				const item = await readVersionItem(ctx, templateVersionId, selection.itemId);
 				const concession = item?.concessions[selection.concessionPosition];
 				if (!item || !concession) throw new ConvexError('This contract snapshot is incomplete.');
 				return {
 					description: concession.description,
+					reviewStatus: selection.reviewStatus,
 					requiresApproval: Boolean(item.instructions?.changesNeedApproval?.trim())
 				};
 			})
@@ -197,7 +229,8 @@ export const startDispatch = internalMutation({
 		const request = await latestFor(ctx, id);
 		if (request?.id !== requestId || request.status !== 'sending' || request.dispatchStarted)
 			return false;
-		if (!(await accessibleContract(ctx, await ctx.db.get('savedContracts', id)))) return false;
+		const contract = await ctx.db.get('savedContracts', id);
+		if (!contract?.companyId || contract.companyId !== request.companyId) return false;
 		await ctx.db.patch('approvalRequests', request._id, { dispatchStarted: true });
 		return true;
 	}
@@ -285,6 +318,81 @@ export const recover = internalMutation({
 		} else if (retryAt !== undefined) {
 			await ctx.scheduler.runAt(retryAt, internal.approvals.recover, { id, requestId });
 		}
+		return null;
+	}
+});
+
+/** An operation receipt prevents an ambiguous retry from overwriting a later decision. */
+export const decide = mutation({
+	args: {
+		membershipId: v.id('memberships'),
+		id: v.id('savedContracts'),
+		itemId: v.id('playbookItems'),
+		concessionId: v.string(),
+		lifecycle: v.string(),
+		status: reviewDecision,
+		operationId: v.string()
+	},
+	returns: v.null(),
+	handler: async (ctx, args) => {
+		const access = await requireMembership(ctx, args.membershipId);
+		if (access.role !== 'admin')
+			throw new ConvexError('Only company admins can review concessions.');
+		if (!args.operationId.trim() || args.operationId.length > 200)
+			throw new ConvexError('Invalid review operation.');
+		const contract = accessibleContract(await ctx.db.get('savedContracts', args.id), access);
+		if (!contract) throw new ConvexError('This contract was deleted.');
+		const operationId = scopedOperation(access, JSON.stringify(['review', args.operationId]));
+		const receipt = await ctx.db
+			.query('concessionDecisions')
+			.withIndex('by_contractId_and_operationId', (q) =>
+				q.eq('contractId', args.id).eq('operationId', operationId)
+			)
+			.unique();
+		if (receipt) {
+			if (
+				receipt.itemId !== args.itemId ||
+				receipt.concessionId !== args.concessionId ||
+				receipt.lifecycle !== args.lifecycle ||
+				receipt.status !== args.status
+			)
+				throw new ConvexError('This review operation was already used.');
+			return null;
+		}
+		if (contract.selectedConcessions[args.itemId] !== args.concessionId)
+			throw new ConvexError('This concession changed. Review its current version.');
+		const reader = await snapshotReader(ctx, contract);
+		const [item] = await reader.selectedItems({ [args.itemId]: args.concessionId });
+		if (!item?.instructions?.changesNeedApproval?.trim())
+			throw new ConvexError('This concession does not require approval.');
+		const lifecycle =
+			contract.reviews?.[args.itemId]?.lifecycle ?? legacyLifecycle(args.itemId, args.concessionId);
+		if (lifecycle !== args.lifecycle)
+			throw new ConvexError('This concession was replaced. Review its current version.');
+		const previousStatus = currentReviewStatus(contract, args.itemId, args.concessionId, lifecycle);
+		const changed = previousStatus !== args.status;
+		await ctx.db.insert('concessionDecisions', {
+			companyId: access.companyId,
+			contractId: args.id,
+			itemId: args.itemId,
+			concessionId: args.concessionId,
+			lifecycle,
+			adminId: access._id,
+			adminName: access.name,
+			adminEmail: access.email,
+			operationId,
+			previousStatus,
+			status: args.status,
+			decidedAt: Date.now(),
+			changed
+		});
+		if (changed)
+			await ctx.db.patch('savedContracts', args.id, {
+				reviews: {
+					...contract.reviews,
+					[args.itemId]: { concessionId: args.concessionId, lifecycle, status: args.status }
+				}
+			});
 		return null;
 	}
 });

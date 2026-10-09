@@ -12,8 +12,11 @@
 		let release = registry?.register(owner, memberships);
 		return {
 			update(next: readonly string[]) {
+				if (memberships.length === next.length && memberships.every((id, i) => id === next[i]))
+					return;
 				release?.();
 				release = registry?.register(owner, next);
+				memberships = next;
 			},
 			destroy() {
 				release?.();
@@ -29,6 +32,7 @@
 		tokens,
 		profileMode = false,
 		interactive = true,
+		navigationCapable = false,
 		selectedAnnotationId,
 		canOpenPlaybookItems,
 		onAnnotationSelect
@@ -36,6 +40,7 @@
 		tokens: readonly InlineToken[];
 		profileMode?: boolean;
 		interactive?: boolean;
+		navigationCapable?: boolean;
 		selectedAnnotationId: string | null;
 		canOpenPlaybookItems: boolean;
 		onAnnotationSelect: (
@@ -58,9 +63,9 @@
 	}
 
 	function handleKeydown(event: KeyboardEvent, itemId: string, annotationId: string) {
-		if (!canOpenPlaybookItems || (event.key !== 'Enter' && event.key !== ' ')) return;
+		if (event.key !== 'Enter' && event.key !== ' ') return;
 		event.preventDefault();
-		if (event.repeat) return;
+		if (!canOpenPlaybookItems || event.repeat) return;
 		onAnnotationSelect(itemId, annotationId, { owner: event.currentTarget as HTMLElement });
 	}
 
@@ -69,24 +74,28 @@
 
 {#each segments as segment}
 	{#if segment.target}
-		<!-- Role and tabindex change together; keep the text nodes stable for search ranges. -->
+		{@const selected =
+			selectedAnnotationId !== null && segment.membershipIds.includes(selectedAnnotationId)}
+		<!-- Mounted semantics and ownership survive temporary action unavailability. -->
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 		<span
 			use:protect={interactive && !profileMode}
-			use:registerOwner={interactive && !profileMode ? segment.membershipIds : []}
+			use:registerOwner={profileMode ? [] : segment.membershipIds}
 			class="playbook-trigger"
-			role={canOpenPlaybookItems ? 'button' : undefined}
-			tabindex={canOpenPlaybookItems ? 0 : undefined}
-			aria-label={canOpenPlaybookItems && segment.tokens.every((token) => !token.value.trim())
+			role={navigationCapable && !profileMode ? 'button' : undefined}
+			tabindex={navigationCapable && !profileMode ? 0 : undefined}
+			aria-label={navigationCapable &&
+			!profileMode &&
+			segment.tokens.every((token) => !token.value.trim())
 				? 'Open playbook item'
 				: undefined}
-			aria-pressed={canOpenPlaybookItems
-				? selectedAnnotationId !== null && segment.membershipIds.includes(selectedAnnotationId)
-				: undefined}
+			aria-pressed={navigationCapable && !profileMode ? selected : undefined}
+			aria-disabled={navigationCapable && !profileMode ? !canOpenPlaybookItems : undefined}
+			data-annotation-selected={profileMode ? undefined : selected}
 			data-item-id={profileMode ? undefined : segment.target.itemId}
 			data-annotation-id={profileMode ? undefined : segment.target.id}
 			data-annotation-memberships={profileMode ? undefined : JSON.stringify(segment.membershipIds)}
-			onkeydown={interactive && !profileMode
+			onkeydown={navigationCapable && !profileMode
 				? (event) => handleKeydown(event, segment.target!.itemId, segment.target!.id)
 				: undefined}
 		>

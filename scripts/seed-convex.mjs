@@ -1,91 +1,74 @@
 import { isDeepStrictEqual } from 'node:util';
-import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { configuredEnv } from './convex-env.mjs';
-import { ConvexHttpClient } from 'convex/browser';
-import { anyApi } from 'convex/server';
+import { companyArguments, companyDeployment, companyRows } from './company-convex.mjs';
 
-function run(...args) {
-	console.log(`target: ${deployment} (${isLocal ? 'local' : 'personal dev'}), convex ${args[0]}`);
-	const result = spawnSync('npx', ['convex', ...args], { stdio: 'inherit' });
-	if (result.error) throw result.error;
-	if (result.status !== 0) throw new Error(`convex ${args[0]} failed (${result.status}).`);
-}
-
-// The import is deliberately restricted to a configured dev deployment.
-const { PUBLIC_CONVEX_URL: url, CONVEX_DEPLOYMENT: deployment } = await configuredEnv(
-	'PUBLIC_CONVEX_URL',
-	'CONVEX_DEPLOYMENT'
-);
-if (!url || !deployment || !/^(dev|local):/.test(deployment)) {
-	throw new Error('Set PUBLIC_CONVEX_URL and a development CONVEX_DEPLOYMENT before seeding.');
-}
-const deploymentName = deployment.split(':', 2)[1];
-const hostname = new URL(url).hostname;
-const isLocal = ['127.0.0.1', 'localhost'].includes(hostname);
-if (
-	(!isLocal &&
-		(deployment !== `dev:${deploymentName}` || hostname !== `${deploymentName}.convex.cloud`)) ||
-	(isLocal && deploymentName !== 'anonymous-agent' && !deployment.startsWith('local:'))
-) {
-	throw new Error('PUBLIC_CONVEX_URL does not match CONVEX_DEPLOYMENT. Import aborted.');
-}
-const target = isLocal ? [] : ['--deployment', deploymentName];
-
+const { companyId } = companyArguments();
+const deployment = await companyDeployment();
 async function readRows(name) {
 	const source = (await readFile(`data/convex/${name}.jsonl`, 'utf8')).trim();
 	if (!source) throw new Error(`${name} import records are empty.`);
 	return source.split('\n').map((row) => JSON.parse(row));
 }
-const expectedBlocks = await readRows('contractBlocks');
-const expectedItems = await readRows('playbookItems');
-
-// Deploy schema and read functions; no records are changed by this command.
-run('run', 'contract:getBlocks', '{}', '--push', ...target);
-const client = new ConvexHttpClient(url);
-const actual = async () => {
-	const [blocks, items] = await Promise.all([
-		client.query(anyApi.contract.getBlocks, {}),
-		client.query(anyApi.playbookItems.list, {})
+const blocks = await readRows('contractBlocks');
+const items = await readRows('playbookItems');
+const importKey = createHash('sha256').update(JSON.stringify({ blocks, items })).digest('hex');
+const scope = { companyId, importKey };
+let progress = await deployment.run('companyTemplateImport:begin', scope);
+async function verifyCommitted() {
+	const [actualBlocks, actualItems] = await Promise.all([
+		companyRows(deployment, companyId, 'blocks'),
+		companyRows(deployment, companyId, 'items')
 	]);
-	return { blocks, items: items.map(({ _id, _creationTime, ...item }) => item) };
-};
-function status(rows, expected, table) {
-	if (!rows.length) return 'missing';
-	if (isDeepStrictEqual(rows, expected)) return 'complete';
-	throw new Error(`${table} contains unexpected data. Import aborted without changing records.`);
-}
-const before = await actual();
-const blockStatus = status(before.blocks, expectedBlocks, 'contractBlocks');
-const itemStatus = status(before.items, expectedItems, 'playbookItems');
-
-if (blockStatus === 'complete' && itemStatus === 'missing') {
-	throw new Error('Contract blocks exist but no items remain. Refusing to restore deleted items.');
-}
-// Maintenance stays enabled after an interrupted import; a verified retry finishes it.
-run('run', 'templates:beginImport', '{}', ...target);
-// Import items first so an interrupted initial import can resume without
-// confusing an intentionally empty item table with a fresh deployment.
-if (itemStatus === 'missing') {
-	run('import', '--table', 'playbookItems', ...target, 'data/convex/playbookItems.jsonl');
-	if (status((await actual()).items, expectedItems, 'playbookItems') !== 'complete') {
-		throw new Error('Playbook Item import did not complete.');
+	if (
+		!isDeepStrictEqual(actualBlocks, blocks.slice(0, progress.blockCount)) ||
+		!isDeepStrictEqual(actualItems, items.slice(0, progress.itemCount))
+	) {
+		throw new Error(
+			'Company data differs from the committed seed prefix. Refusing to overwrite or restore it.'
+		);
 	}
 }
-if (blockStatus === 'missing') {
-	run('import', '--table', 'contractBlocks', ...target, 'data/convex/contractBlocks.jsonl');
-	if (status((await actual()).blocks, expectedBlocks, 'contractBlocks') !== 'complete') {
-		throw new Error('Contract block import did not complete.');
+await verifyCommitted();
+// Small atomic batches keep retries within Convex and CLI argument limits.
+while (progress.blockCount < blocks.length || progress.itemCount < items.length) {
+	const next = {
+		...scope,
+		expectedBlockCount: progress.blockCount,
+		expectedItemCount: progress.itemCount,
+		blocks: [],
+		items: []
+	};
+	for (const [table, count] of [
+		['items', progress.itemCount],
+		['blocks', progress.blockCount]
+	]) {
+		const source = table === 'items' ? items : blocks;
+		for (let i = count; i < source.length && next.blocks.length + next.items.length < 4; i++) {
+			next[table].push(source[i]);
+			if (Buffer.byteLength(JSON.stringify(next)) > 64_000) {
+				next[table].pop();
+				break;
+			}
+		}
 	}
+	if (!next.blocks.length && !next.items.length)
+		throw new Error(
+			'A seed record exceeds the supported CLI batch size. Import remains in maintenance.'
+		);
+	await deployment.run('companyTemplateImport:append', next);
+	progress = {
+		blockCount: progress.blockCount + next.blocks.length,
+		itemCount: progress.itemCount + next.items.length,
+		complete: false
+	};
 }
-const after = await actual();
-if (
-	status(after.blocks, expectedBlocks, 'contractBlocks') !== 'complete' ||
-	status(after.items, expectedItems, 'playbookItems') !== 'complete'
-) {
-	throw new Error('Contract import is incomplete.');
-}
-run('run', 'templates:finishImport', '{}', ...target);
+await verifyCommitted();
+await deployment.run('companyTemplateImport:finish', {
+	...scope,
+	blockCount: blocks.length,
+	itemCount: items.length
+});
 console.log(
-	`Seed baseline round trip verified: ${after.blocks.length} blocks, ${after.items.length} items.`
+	`Company ${companyId} seed round trip verified: ${blocks.length} blocks, ${items.length} items.`
 );

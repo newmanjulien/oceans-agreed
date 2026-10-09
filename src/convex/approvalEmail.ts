@@ -10,7 +10,6 @@ class RecipientRejected extends Error {}
 
 function configuration() {
 	const values = {
-		APPROVAL_EMAIL: env.APPROVAL_EMAIL?.trim(),
 		APP_URL: env.APP_URL?.trim(),
 		SMTP_USER: env.SMTP_USER?.trim(),
 		SMTP_APP_PASSWORD: env.SMTP_APP_PASSWORD?.trim()
@@ -39,7 +38,6 @@ function configuration() {
 			'APP_URL must be an HTTP or HTTPS app URL without credentials, a query, or a fragment.'
 		);
 	return {
-		to: values.APPROVAL_EMAIL!,
 		appUrl: url.href.replace(/\/$/, ''),
 		user: values.SMTP_USER!,
 		password: values.SMTP_APP_PASSWORD!
@@ -103,11 +101,19 @@ function diagnostics(cause: unknown) {
 
 function failure(cause: unknown, dispatched: boolean) {
 	const diagnostic = diagnostics(cause);
+	// Nodemailer replaces network error codes with ESOCKET but retains syscall.
+	// CONN alone is insufficient: it also labels failures after sending DATA.
+	const connectionFailed =
+		typeof cause === 'object' &&
+		cause !== null &&
+		'syscall' in cause &&
+		cause.syscall === 'connect';
 	const rejected =
 		cause instanceof RecipientRejected ||
 		(diagnostic.responseCode !== undefined && diagnostic.responseCode >= 400);
 	const confirmed =
 		!dispatched ||
+		connectionFailed ||
 		rejected ||
 		['EAUTH', 'EENVELOPE', 'EDNS'].includes(diagnostic.code ?? '') ||
 		(diagnostic.code === 'EMESSAGE' && ['API', 'MAIL FROM'].includes(diagnostic.command ?? ''));
@@ -119,7 +125,8 @@ function failure(cause: unknown, dispatched: boolean) {
 	else if (diagnostic.code === 'EAUTH')
 		error = 'Gmail authentication failed. Check SMTP_USER and SMTP_APP_PASSWORD, then retry.';
 	else if (rejected || diagnostic.code === 'EENVELOPE')
-		error = 'Gmail rejected the approval email. Check the sender and APPROVAL_EMAIL, then retry.';
+		error =
+			'Gmail rejected the approval email. Check the sender and company approval email, then retry.';
 	else if (diagnostic.code === 'EMESSAGE')
 		error =
 			'The approval email could not be prepared. Check the Gmail SMTP configuration, then retry.';
@@ -144,18 +151,34 @@ export const send = internalAction({
 			stage = 'load_descriptions';
 			const requiresApproval: string[] = [];
 			const noApprovalRequired: string[] = [];
-			// Each query returns at most four descriptions, keeping both result size
-			// and reads bounded. The full email exists only inside this Node action.
-			for (let offset = 0; offset < request.selectionCount; offset += 4) {
-				const descriptions = await ctx.runQuery(internal.approvals.descriptions, {
-					...args,
-					offset
-				});
-				if (!descriptions) return null;
-				for (const c of descriptions)
-					(c.requiresApproval ? requiresApproval : noApprovalRequired).push(`- ${c.description}`);
+			const reviewed: string[] = [];
+			// Four queries at a time, each reading at most four items. Metadata is
+			// captured once above; the full email exists only inside this Node action.
+			for (let offset = 0; offset < request.selectedConcessions.length; offset += 16) {
+				const batches = await Promise.all(
+					[0, 4, 8, 12]
+						.filter((start) => offset + start < request.selectedConcessions.length)
+						.map((start) =>
+							ctx.runQuery(internal.approvals.descriptions, {
+								templateVersionId: request.templateVersionId,
+								selectedConcessions: request.selectedConcessions.slice(
+									offset + start,
+									offset + start + 4
+								)
+							})
+						)
+				);
+				for (const c of batches.flat())
+					(c.requiresApproval
+						? !c.reviewStatus || c.reviewStatus === 'pending'
+							? requiresApproval
+							: reviewed
+						: noApprovalRequired
+					).push(
+						`- ${c.description}${c.requiresApproval && c.reviewStatus && c.reviewStatus !== 'pending' ? ` (${c.reviewStatus === 'approved' ? 'Approved' : 'Not approved'})` : ''}`
+					);
 			}
-			const concessions = `Concessions requiring approval:\n${requiresApproval.join('\n')}${
+			const concessions = `Concessions waiting for review:\n${requiresApproval.join('\n')}${reviewed.length ? `\n\nPreviously reviewed concessions:\n${reviewed.join('\n')}` : ''}${
 				noApprovalRequired.length
 					? `\n\nConcessions not requiring approval:\n${noApprovalRequired.join('\n')}`
 					: ''
@@ -172,9 +195,9 @@ export const send = internalAction({
 			});
 			const mail = {
 				from: config.user,
-				to: config.to,
+				to: request.recipientEmail,
 				subject: `Approval requested — ${request.companyName}'s contract`,
-				text: `Approval was requested for contract that's being prepared for ${request.companyName}.\n\nOpen the contract to approve: ${config.appUrl}/contracts/${args.id}\n\n${concessions}`
+				text: `Approval was requested for contract that's being prepared for ${request.companyName}.\n\nOpen the contract to approve: ${config.appUrl}/contracts/${args.id}?review=1\n\n${concessions}`
 			};
 			stage = 'mark_dispatch';
 			// Do not retry this write: an ambiguous write failure must never lead to SMTP.

@@ -185,8 +185,18 @@ export async function reconcile(server, blocks, items) {
 	const { validateConcessionUpdate } = await server.ssrLoadModule(
 		'/src/lib/playbook/validation.ts'
 	);
+	const companyId = 'seed-company';
+	const profileId = 'seed-profile';
+	const membershipId = 'seed-membership';
+	const identity = {
+		issuer: 'https://seed-verifier.invalid',
+		subject: 'seed-user',
+		tokenIdentifier: 'https://seed-verifier.invalid|seed-user',
+		email: 'seed@seed-verifier.invalid',
+		emailVerified: true
+	};
 	for (const [i, item] of items.entries()) {
-		const saved = { ...item, _id: `seed-item-${i}`, _creationTime: 0 };
+		const saved = { ...item, companyId, _id: `seed-item-${i}`, _creationTime: 0 };
 		assert.deepEqual(
 			semanticPlaybookDraft(editingPlaybookDraft(saved)),
 			item,
@@ -198,14 +208,27 @@ export async function reconcile(server, blocks, items) {
 		// verified separately; this adapter checks preserved business payloads.
 		let persisted = structuredClone(saved);
 		const tables = new Map([
-			['contractBlocks', blocks],
+			['profiles', [{ _id: profileId, identity: identity.tokenIdentifier, role: 'admin' }]],
+			['memberships', [{ _id: membershipId, companyId, profileId }]],
+			['company', [{ _id: companyId, ownerProfileId: profileId }]],
+			[
+				'currentTemplate',
+				[{ _id: 'seed-pointer', companyId, versionId: 'seed-version', maintenance: false }]
+			],
+			['contractBlocks', blocks.map((block) => ({ ...block, companyId }))],
 			[
 				'playbookItems',
-				items.map((value, index) => ({ ...value, _id: `seed-item-${index}`, _creationTime: 0 }))
+				items.map((value, index) => ({
+					...value,
+					companyId,
+					_id: `seed-item-${index}`,
+					_creationTime: 0
+				}))
 			]
 		]);
 		let nextId = 0;
 		const ctx = {
+			auth: { getUserIdentity: async () => identity },
 			meta: {
 				getTransactionMetrics: async () => ({
 					documentsWritten: { remaining: 16_384 },
@@ -241,13 +264,22 @@ export async function reconcile(server, blocks, items) {
 			}
 		};
 		const result = await savePlaybookItem._handler(ctx, {
+			membershipId,
 			id: saved._id,
 			item: semanticPlaybookDraft(editingPlaybookDraft(saved)),
 			expectedRevision: 0,
 			operationId: '00000000-0000-4000-8000-000000000000'
 		});
 		assert.equal(result.status, 'saved', `Mutation rejected item ${i}`);
-		const { _id, _creationTime, revision, lastOperationId, ...business } = persisted;
+		const {
+			_id,
+			_creationTime,
+			companyId: _companyId,
+			revision,
+			lastOperationCaller,
+			lastOperationId,
+			...business
+		} = persisted;
 		assert.deepEqual(business, item, `Mutation drops business fields: ${i}`);
 		const html = render(RepPlaybookPanel, {
 			props: { item: saved, onToggle: () => {}, onClose: () => {} }

@@ -48,6 +48,8 @@
 	import LoadingPagination from './LoadingPagination.svelte';
 	import ContractWorkspaceLayout from './ContractWorkspaceLayout.svelte';
 	import '$lib/styles/document.css';
+	import ReviewTags from './ReviewTags.svelte';
+	import type { ReviewTag, ReviewDecision, ReviewNavigation } from '$lib/contract/approval';
 	const annotationRegistry = setAnnotationRegistry();
 	let {
 		active = true,
@@ -59,6 +61,9 @@
 		followScroll = false,
 		panelContent,
 		footerContent,
+		reviewTags = [],
+		reviewNavigation,
+		onReviewDecision,
 		selectedConcessions,
 		onRemoveConcession,
 		selectedAnnotationId = null,
@@ -67,6 +72,7 @@
 		panelSource,
 		picking = false,
 		allowPlaybookNavigation = true,
+		playbookNavigationReady = true,
 		onSelect
 	}: {
 		active?: boolean;
@@ -78,6 +84,9 @@
 		followScroll?: boolean;
 		panelContent: Snippet;
 		footerContent?: Snippet;
+		reviewTags?: readonly ReviewTag[];
+		reviewNavigation?: ReviewNavigation;
+		onReviewDecision?: (tag: ReviewTag, status: ReviewDecision) => void;
 		selectedConcessions: ConcessionSelection;
 		onRemoveConcession: (itemId: string) => void;
 		selectedAnnotationId?: string | null;
@@ -86,6 +95,7 @@
 		panelSource?: SourcePoint;
 		picking?: boolean;
 		allowPlaybookNavigation?: boolean;
+		playbookNavigationReady?: boolean;
 		onSelect: (itemId: string, annotationId: string) => boolean | void;
 	} = $props();
 	const { source, renderer, viewer } = getContractWorkspace();
@@ -104,7 +114,7 @@
 	let highlightRects = $state.raw<PageHighlights>(new Map());
 	$effect(() => {
 		const stage = viewer.documentStageElement;
-		if (!interacting || !stage || !viewer.visible) return;
+		if (!active || !stage || !viewer.visible) return;
 		const abort = new AbortController();
 		let controller: DocumentHighlightController | undefined;
 		let unsubscribe: (() => void) | undefined;
@@ -130,7 +140,7 @@
 	$effect(() => {
 		const stage = viewer.documentStageElement,
 			controller = highlights;
-		if (!interacting || !stage || !controller || !allowPlaybookNavigation) return;
+		if (!active || !stage || !controller) return;
 		const interactions = new DocumentClauseInteractions(stage, controller, selectAnnotation);
 		clauseInteractions = interactions;
 		return () => {
@@ -173,9 +183,9 @@
 	>();
 	$effect(() => {
 		const root = viewer.documentStageElement,
-			commit = snapshot,
+			commit = pageElementsSnapshot,
 			controller = highlights;
-		if (!root || !commit || !controller || !viewer.ready) return;
+		if (!root || !commit || !controller || !viewer.visible) return;
 		const selected = new Set(selectedRanges);
 		for (const range of authoringRanges.keys())
 			if (!selected.has(range)) authoringRanges.delete(range);
@@ -218,7 +228,50 @@
 	});
 	$effect(() => {
 		const stage = viewer.documentStageElement;
-		if (!interacting || !stage) return;
+		if (!active || !stage) return;
+		let focusVersion = 0;
+		let commitVersion = 0;
+		let cancelled = false;
+		const intent = () => focusVersion++;
+		const listeners = new AbortController();
+		for (const event of ['focusin', 'pointerdown', 'keydown'])
+			document.addEventListener(event, intent, { capture: true, signal: listeners.signal });
+		const unsubscribe = renderer.beforeCommit(() => {
+			const generation = ++commitVersion;
+			const owner = document.activeElement;
+			if (!(owner instanceof HTMLElement) || !stage.contains(owner) || owner.tabIndex < 0) return;
+			const annotationId = owner.dataset.annotationId;
+			if (!annotationId) return;
+			const occurrence = annotationOccurrence(annotationId, { owner });
+			const version = focusVersion;
+			void tick().then(() => {
+				if (
+					cancelled ||
+					generation !== commitVersion ||
+					!active ||
+					!navigationCapable ||
+					viewer.documentStageElement !== stage ||
+					!stage.isConnected ||
+					version !== focusVersion ||
+					(document.activeElement && document.activeElement !== document.body)
+				)
+					return;
+				const index = snapshot?.source.sourceIndex;
+				const anchor = index
+					? resolveAnnotationAnchor(annotationRegistry, index, annotationId, occurrence)
+					: undefined;
+				(anchor?.owner ?? stage).focus({ preventScroll: true });
+			});
+		});
+		return () => {
+			cancelled = true;
+			listeners.abort();
+			unsubscribe();
+		};
+	});
+	$effect(() => {
+		const stage = viewer.documentStageElement;
+		if (!active || !stage) return;
 		let scrollVersion = 0;
 		const onScroll = () => scrollVersion++;
 		window.addEventListener('scroll', onScroll, { passive: true });
@@ -255,7 +308,7 @@
 			const capturedScrollVersion = scrollVersion;
 			void tick().then(() => {
 				if (
-					!interacting ||
+					!active ||
 					!stage.isConnected ||
 					window.scrollY !== scrollY ||
 					scrollVersion !== capturedScrollVersion ||
@@ -358,8 +411,9 @@
 		!activationComplete &&
 			(!pageElementsSnapshot || pageElementsSnapshot.id !== targetGeneration || !current)
 	);
+	const navigationCapable = $derived(active && allowPlaybookNavigation && !picking);
 	const canOpenPlaybookItems = $derived(
-		interacting && viewer.prepared && current && allowPlaybookNavigation && !picking
+		interacting && viewer.prepared && current && navigationCapable && playbookNavigationReady
 	);
 	$effect(() => {
 		clauseInteractions?.setEnabled(canOpenPlaybookItems);
@@ -368,14 +422,16 @@
 	let layoutWidth = $state(PAGE_FORMAT.width + 30);
 	let panelTop = $state(0);
 	let selectedOccurrence = $state.raw<AnnotationOccurrence | null>(null);
+	let pageViewport = $state<HTMLDivElement>();
+	const reviewGutter = $derived(reviewTags.length ? 100 : 0);
 	const pageScale = $derived(
 		Math.min(
 			1,
 			Math.max(
-				280,
-				layoutWidth >= SIDE_PANEL_BREAKPOINT
+				reviewGutter ? 120 : 280,
+				(layoutWidth >= SIDE_PANEL_BREAKPOINT
 					? layoutWidth - SIDE_PANEL_RESERVED_WIDTH
-					: layoutWidth - 30
+					: layoutWidth - 30) - reviewGutter
 			) / PAGE_FORMAT.width
 		)
 	);
@@ -423,7 +479,7 @@
 			occurrence = selectedOccurrence,
 			point = panelSource;
 		return () => {
-			if (!interacting) return;
+			if (!active) return;
 			const anchor = annotationAnchor(id, occurrence, point);
 			(anchor?.owner ?? viewer.documentStageElement)?.focus({ preventScroll: true });
 		};
@@ -433,7 +489,7 @@
 	}
 	async function positionPanel() {
 		await tick();
-		if (!interacting || !viewer.documentStageElement || !hasPanel) return;
+		if (!active || !viewer.documentStageElement || !hasPanel) return;
 		const anchor = annotationAnchor();
 		const bounds =
 			(anchor ? annotationAnchorBounds(anchor) : null) ??
@@ -465,15 +521,15 @@
 		void panelSource;
 		void hasPanel;
 		void pageScale;
-		if (interacting) void positionPanel();
+		if (active) void positionPanel();
 	});
 	async function keepPanelVisible() {
 		const panel = layoutElement?.querySelector<HTMLElement>('[data-workspace-panel]');
-		if (!interacting || !panel || !hasPanel) return;
+		if (!active || !panel || !hasPanel) return;
 		await positionPanel();
 		await tick();
 		if (
-			!interacting ||
+			!active ||
 			!hasPanel ||
 			followScroll ||
 			layoutElement?.querySelector('[data-workspace-panel]') !== panel
@@ -489,7 +545,7 @@
 	let wasFollowingScroll = false;
 	$effect(() => {
 		const following = followScroll;
-		if (interacting && wasFollowingScroll && !following) untrack(() => void keepPanelVisible());
+		if (active && wasFollowingScroll && !following) untrack(() => void keepPanelVisible());
 		wasFollowingScroll = following;
 	});
 	$effect(() => {
@@ -570,7 +626,7 @@
 		};
 	});
 	$effect(() => {
-		if (!interacting) return;
+		if (!active) return;
 		viewer.restoreAnnotationFocus = restoreAnnotationFocus;
 		viewer.captureAnnotationFocus = captureAnnotationFocus;
 		return () => {
@@ -688,7 +744,7 @@
 		return () => abort.abort();
 	});
 	$effect(() => {
-		if (interacting && viewer.visible && snapshot && profiler)
+		if (active && viewer.visible && snapshot && profiler)
 			untrack(() => renderer.protectGeometry(profiler!));
 	});
 	let lastReadySnapshot: typeof snapshot;
@@ -778,20 +834,34 @@
 	>
 		{#snippet documentContent()}
 			<div
-				class="page-viewport relative shrink-0"
+				class="page-viewport relative isolate shrink-0 focus:outline-none"
+				bind:this={pageViewport}
+				style:--review-gutter-width={`${reviewGutter}px`}
+				style:margin-left="var(--review-gutter-width)"
 				style:width={`${displayWidth}px`}
 				style:height={`${displayHeight}px`}
 			>
+				<ReviewTags
+					host={pageViewport}
+					tags={reviewTags}
+					navigation={reviewNavigation}
+					onDecision={onReviewDecision}
+					ready={interacting && viewer.ready}
+					index={pageElementsSnapshot?.source.sourceIndex ?? snapshot?.source.sourceIndex}
+					pages={mountedPages}
+					scale={pageScale}
+				/>
 				<div
-					class="page-stack absolute top-0 left-0 flex w-(--contract-page-width) origin-top-left flex-col gap-(--contract-page-gap)"
+					class="page-stack absolute top-0 left-0 z-1 flex w-(--contract-page-width) origin-top-left flex-col gap-(--contract-page-gap)"
 					style:transform={`scale(${pageScale})`}
 				>
 					{#each mountedPages as page (page.number)}
 						<DocumentPage
 							{page}
-							interactive={interacting}
+							interactive={active && (interactive || allowPlaybookNavigation)}
 							highlights={highlightRects.get(page.number) ?? EMPTY_HIGHLIGHTS}
 							{selectedAnnotationId}
+							{navigationCapable}
 							{canOpenPlaybookItems}
 							onAnnotationSelect={selectAnnotation}
 						/>
@@ -816,9 +886,9 @@
 		{/snippet}
 		<ContractWorkspaceLayout
 			{hasPanel}
-			interactive={interacting}
+			interactive={active && (interactive || allowPlaybookNavigation)}
 			{followScroll}
-			displayedPageWidth={displayWidth}
+			displayedPageWidth={displayWidth + reviewGutter}
 			documentHeight={displayHeight}
 			{panelTop}
 			bind:layoutElement

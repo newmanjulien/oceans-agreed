@@ -1,7 +1,9 @@
 import { browser } from '$app/environment';
 import { env } from '$env/dynamic/public';
 import type { SavedContractCard } from './card';
+import type { Id } from '../../convex/_generated/dataModel';
 export let CACHE_NAMESPACE = `agreed:v2:${env.PUBLIC_CONVEX_URL ?? ''}:anonymous`;
+export let CACHE_MEMBERSHIP_ID: Id<'memberships'> | null = null;
 const openingsKey = () => `${CACHE_NAMESPACE}:openings`;
 type Opening = { id: string; openedAt: number };
 let openings: Opening[] | undefined;
@@ -65,8 +67,11 @@ export function rankCards(
 		.map(({ card }) => card._id);
 }
 
-export function setCacheIdentity(identity: string | null) {
-	const next = `agreed:v2:${env.PUBLIC_CONVEX_URL ?? ''}:${identity ?? 'anonymous'}`;
+export function setCacheIdentity(
+	identity: { profileId: Id<'profiles'>; membershipId: Id<'memberships'> } | null
+) {
+	const next = `agreed:v2:${env.PUBLIC_CONVEX_URL ?? ''}:${identity ? `${identity.profileId}:${identity.membershipId}` : 'anonymous'}`;
+	CACHE_MEMBERSHIP_ID = identity?.membershipId ?? null;
 	if (next === CACHE_NAMESPACE) return;
 	if (browser) {
 		try {
